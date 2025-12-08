@@ -75,7 +75,7 @@ typealias RefinerProgressCallback = (tilesProcessed: Int, totalTiles: Int, messa
  */
 class MFSRRefiner(
     private val context: Context,
-    private val config: RefinerConfig = RefinerConfig()
+    private var config: RefinerConfig = RefinerConfig()
 ) : AutoCloseable {
     
     private var interpreter: Interpreter? = null
@@ -93,6 +93,20 @@ class MFSRRefiner(
     private var outputBuffer: ByteBuffer? = null
     
     private var isInitialized = false
+    
+    /**
+     * Get current blend strength
+     */
+    fun getBlendStrength(): Float = config.blendStrength
+    
+    /**
+     * Set blend strength dynamically
+     * @param strength 0.0 = original MFSR output, 1.0 = fully refined
+     */
+    fun setBlendStrength(strength: Float) {
+        config = config.copy(blendStrength = strength.coerceIn(0f, 1f))
+        Log.d(TAG, "Blend strength set to: ${config.blendStrength}")
+    }
     
     /**
      * Initialize the refiner

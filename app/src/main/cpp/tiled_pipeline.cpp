@@ -17,14 +17,41 @@
 
 namespace ultradetail {
 
+// Lanczos kernel support size (3 = sharper but more ringing, 2 = safer)
+static constexpr float LANCZOS_A = 3.0f;
+
 // Standalone Lanczos weight function
-static inline float lanczosWeight(float distance, float a = 2.0f) {
+// Using Lanczos-3 for maximum sharpness in super-resolution
+static inline float lanczosWeight(float distance, float a = LANCZOS_A) {
     if (distance == 0.0f) return 1.0f;
     if (std::abs(distance) >= a) return 0.0f;
     
     float pi_d = M_PI * distance;
     float pi_d_a = pi_d / a;
     return (std::sin(pi_d) / pi_d) * (std::sin(pi_d_a) / pi_d_a);
+}
+
+/**
+ * De-ringing clamp: Limits output to the local min/max of input samples
+ * This prevents Lanczos ringing (halos) around high-contrast edges
+ * 
+ * @param value The interpolated value
+ * @param localMin Minimum of nearby input samples
+ * @param localMax Maximum of nearby input samples
+ * @return Clamped value within [localMin, localMax]
+ */
+static inline float deringClamp(float value, float localMin, float localMax) {
+    return clamp(value, localMin, localMax);
+}
+
+static inline RGBPixel deringClampRGB(const RGBPixel& value, 
+                                       const RGBPixel& localMin, 
+                                       const RGBPixel& localMax) {
+    return RGBPixel(
+        deringClamp(value.r, localMin.r, localMax.r),
+        deringClamp(value.g, localMin.g, localMax.g),
+        deringClamp(value.b, localMin.b, localMax.b)
+    );
 }
 
 TiledMFSRPipeline::TiledMFSRPipeline(const TilePipelineConfig& config)
@@ -396,10 +423,23 @@ void TiledMFSRPipeline::processTile(
     int outWidth = tile.width * config_.scaleFactor;
     int outHeight = tile.height * config_.scaleFactor;
     
-    // Accumulator for high-res grid
+    // Accumulator for high-res grid with min/max tracking for de-ringing
     struct AccumPixel {
         float r, g, b, weight;
-        AccumPixel() : r(0), g(0), b(0), weight(0) {}
+        float minR, minG, minB;  // Local minimum for de-ringing
+        float maxR, maxG, maxB;  // Local maximum for de-ringing
+        AccumPixel() : r(0), g(0), b(0), weight(0),
+                       minR(1.0f), minG(1.0f), minB(1.0f),
+                       maxR(0.0f), maxG(0.0f), maxB(0.0f) {}
+        
+        void updateMinMax(const RGBPixel& p) {
+            minR = std::min(minR, p.r);
+            minG = std::min(minG, p.g);
+            minB = std::min(minB, p.b);
+            maxR = std::max(maxR, p.r);
+            maxG = std::max(maxG, p.g);
+            maxB = std::max(maxB, p.b);
+        }
     };
     ImageBuffer<AccumPixel> accumulator(outWidth, outHeight);
     
@@ -436,24 +476,25 @@ void TiledMFSRPipeline::processTile(
                     robustWeight = computeRobustnessWeight(pixel, refCrop.at(x, y), fv.confidence);
                 }
                 
-                // Lanczos-2 splatting (4x4 kernel)
-                const float lanczosA = 2.0f;
-                int x0 = static_cast<int>(std::floor(dstX)) - 1;
-                int y0 = static_cast<int>(std::floor(dstY)) - 1;
+                // Lanczos-3 splatting (6x6 kernel) for maximum sharpness
+                const int kernelRadius = static_cast<int>(LANCZOS_A);  // 3 for Lanczos-3
+                const int kernelSize = kernelRadius * 2;  // 6x6 kernel
+                int x0 = static_cast<int>(std::floor(dstX)) - kernelRadius + 1;
+                int y0 = static_cast<int>(std::floor(dstY)) - kernelRadius + 1;
                 
-                for (int ky = 0; ky < 4; ++ky) {
+                for (int ky = 0; ky < kernelSize; ++ky) {
                     int py = y0 + ky;
                     if (py < 0 || py >= outHeight) continue;
                     
                     float dy = std::abs(dstY - py);
-                    float wy = lanczosWeight(dy, lanczosA);
+                    float wy = lanczosWeight(dy);
                     
-                    for (int kx = 0; kx < 4; ++kx) {
+                    for (int kx = 0; kx < kernelSize; ++kx) {
                         int px = x0 + kx;
                         if (px < 0 || px >= outWidth) continue;
                         
                         float dx = std::abs(dstX - px);
-                        float wx = lanczosWeight(dx, lanczosA);
+                        float wx = lanczosWeight(dx);
                         
                         float w = wx * wy * fv.confidence * robustWeight;
                         if (w <= 0.0f) continue;
@@ -463,6 +504,9 @@ void TiledMFSRPipeline::processTile(
                         acc.g += pixel.g * w;
                         acc.b += pixel.b * w;
                         acc.weight += w;
+                        
+                        // Track local min/max for de-ringing clamp
+                        acc.updateMinMax(pixel);
                     }
                 }
             }
@@ -480,9 +524,21 @@ void TiledMFSRPipeline::processTile(
             
             if (acc.weight > 0.0f) {
                 float invW = 1.0f / acc.weight;
-                out.r = clamp(acc.r * invW, 0.0f, 1.0f);
-                out.g = clamp(acc.g * invW, 0.0f, 1.0f);
-                out.b = clamp(acc.b * invW, 0.0f, 1.0f);
+                float rawR = acc.r * invW;
+                float rawG = acc.g * invW;
+                float rawB = acc.b * invW;
+                
+                // De-ringing clamp: limit output to local min/max of input samples
+                // This prevents Lanczos-3 ringing (halos) around high-contrast edges
+                out.r = clamp(rawR, acc.minR, acc.maxR);
+                out.g = clamp(rawG, acc.minG, acc.maxG);
+                out.b = clamp(rawB, acc.minB, acc.maxB);
+                
+                // Final clamp to valid range
+                out.r = clamp(out.r, 0.0f, 1.0f);
+                out.g = clamp(out.g, 0.0f, 1.0f);
+                out.b = clamp(out.b, 0.0f, 1.0f);
+                
                 validPixels++;
             } else {
                 // Gap - will be filled by interpolation

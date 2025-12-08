@@ -731,4 +731,273 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeGetResultInfo(
     return 0;
 }
 
+/**
+ * Process YUV frames directly through the MFSR pipeline
+ * This avoids the ~360MB memory spike from converting all frames to RGB upfront.
+ * YUV->RGB conversion happens on-the-fly per tile in native code.
+ * 
+ * @param handle Pipeline handle
+ * @param yPlanes Array of Y plane ByteBuffers
+ * @param uPlanes Array of U plane ByteBuffers
+ * @param vPlanes Array of V plane ByteBuffers
+ * @param yRowStrides Y plane row strides
+ * @param uvRowStrides UV plane row strides
+ * @param uvPixelStrides UV pixel strides
+ * @param width Frame width
+ * @param height Frame height
+ * @param referenceIndex Index of reference frame (-1 for auto-select)
+ * @param homographies Flattened 3x3 homography matrices (9 floats per frame), or null
+ * @param gyroMagnitudes Total gyro rotation magnitude per frame (for auto-select)
+ * @param outputBitmap Pre-allocated output bitmap (scaled size)
+ * @param callback Progress callback object
+ * @return Result code (0 = success), or selected reference index if referenceIndex was -1
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessYUV(
+    JNIEnv* env,
+    jobject thiz,
+    jlong handle,
+    jobjectArray yPlanes,
+    jobjectArray uPlanes,
+    jobjectArray vPlanes,
+    jintArray yRowStrides,
+    jintArray uvRowStrides,
+    jintArray uvPixelStrides,
+    jint width,
+    jint height,
+    jint referenceIndex,
+    jfloatArray homographies,
+    jfloatArray gyroMagnitudes,
+    jobject outputBitmap,
+    jobject callback
+) {
+    auto* pipeline = reinterpret_cast<TiledMFSRPipeline*>(handle);
+    if (!pipeline) {
+        LOGE("Invalid pipeline handle");
+        return -1;
+    }
+    
+    int numFrames = env->GetArrayLength(yPlanes);
+    if (numFrames < 2) {
+        LOGE("Need at least 2 frames for MFSR");
+        return -2;
+    }
+    
+    LOGI("Processing %d YUV frames (%dx%d) through MFSR pipeline", numFrames, width, height);
+    
+    // Get stride arrays
+    jint* yStrides = env->GetIntArrayElements(yRowStrides, nullptr);
+    jint* uvStrides = env->GetIntArrayElements(uvRowStrides, nullptr);
+    jint* uvPixStrides = env->GetIntArrayElements(uvPixelStrides, nullptr);
+    
+    // Smart reference frame selection: choose frame with lowest gyro rotation
+    int selectedRef = referenceIndex;
+    if (referenceIndex < 0 && gyroMagnitudes != nullptr) {
+        int gyroLen = env->GetArrayLength(gyroMagnitudes);
+        if (gyroLen >= numFrames) {
+            jfloat* gyroMags = env->GetFloatArrayElements(gyroMagnitudes, nullptr);
+            float minRotation = gyroMags[0];
+            selectedRef = 0;
+            for (int i = 1; i < numFrames; ++i) {
+                if (gyroMags[i] < minRotation) {
+                    minRotation = gyroMags[i];
+                    selectedRef = i;
+                }
+            }
+            env->ReleaseFloatArrayElements(gyroMagnitudes, gyroMags, JNI_ABORT);
+            LOGI("Auto-selected reference frame %d (lowest gyro rotation: %.4f rad)", 
+                 selectedRef, minRotation);
+        } else {
+            selectedRef = numFrames / 2;  // Fallback to middle
+        }
+    } else if (referenceIndex < 0) {
+        selectedRef = numFrames / 2;  // Fallback to middle
+    }
+    
+    // Convert YUV frames to RGB on-the-fly (one at a time to save memory)
+    std::vector<RGBImage> frames(numFrames);
+    std::vector<GrayImage> grayFrames(numFrames);
+    
+    for (int i = 0; i < numFrames; ++i) {
+        jobject yBuf = env->GetObjectArrayElement(yPlanes, i);
+        jobject uBuf = env->GetObjectArrayElement(uPlanes, i);
+        jobject vBuf = env->GetObjectArrayElement(vPlanes, i);
+        
+        uint8_t* yData = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuf));
+        uint8_t* uData = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuf));
+        uint8_t* vData = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuf));
+        
+        if (!yData || !uData || !vData) {
+            LOGE("Failed to get buffer address for frame %d", i);
+            env->ReleaseIntArrayElements(yRowStrides, yStrides, JNI_ABORT);
+            env->ReleaseIntArrayElements(uvRowStrides, uvStrides, JNI_ABORT);
+            env->ReleaseIntArrayElements(uvPixelStrides, uvPixStrides, JNI_ABORT);
+            return -3;
+        }
+        
+        frames[i].resize(width, height);
+        grayFrames[i].resize(width, height);
+        
+        int yRowStride = yStrides[i];
+        int uvRowStride = uvStrides[i];
+        int uvPixelStride = uvPixStrides[i];
+        
+        // YUV420 to RGB conversion
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                int yIdx = y * yRowStride + x;
+                int uvIdx = (y / 2) * uvRowStride + (x / 2) * uvPixelStride;
+                
+                int yVal = (yData[yIdx] & 0xFF) - 16;
+                int uVal = (uData[uvIdx] & 0xFF) - 128;
+                int vVal = (vData[uvIdx] & 0xFF) - 128;
+                
+                // BT.601 YUV to RGB
+                float r = (1.164f * yVal + 1.596f * vVal) / 255.0f;
+                float g = (1.164f * yVal - 0.813f * vVal - 0.391f * uVal) / 255.0f;
+                float b = (1.164f * yVal + 2.018f * uVal) / 255.0f;
+                
+                r = clamp(r, 0.0f, 1.0f);
+                g = clamp(g, 0.0f, 1.0f);
+                b = clamp(b, 0.0f, 1.0f);
+                
+                frames[i].at(x, y) = RGBPixel(r, g, b);
+                grayFrames[i].at(x, y) = 0.299f * r + 0.587f * g + 0.114f * b;
+            }
+        }
+        
+        LOGD("Converted frame %d YUV->RGB", i);
+    }
+    
+    env->ReleaseIntArrayElements(yRowStrides, yStrides, JNI_ABORT);
+    env->ReleaseIntArrayElements(uvRowStrides, uvStrides, JNI_ABORT);
+    env->ReleaseIntArrayElements(uvPixelStrides, uvPixStrides, JNI_ABORT);
+    
+    // Parse homographies if provided
+    std::vector<GyroHomography> gyroHomographies;
+    if (homographies != nullptr) {
+        int homLen = env->GetArrayLength(homographies);
+        if (homLen >= numFrames * 9) {
+            jfloat* homData = env->GetFloatArrayElements(homographies, nullptr);
+            
+            for (int i = 0; i < numFrames; ++i) {
+                GyroHomography gh;
+                for (int j = 0; j < 9; ++j) {
+                    gh.h[j] = homData[i * 9 + j];
+                }
+                gh.isValid = true;
+                gyroHomographies.push_back(gh);
+            }
+            
+            env->ReleaseFloatArrayElements(homographies, homData, JNI_ABORT);
+        }
+    }
+    
+    // Setup progress callback
+    jmethodID progressMethod = nullptr;
+    if (callback != nullptr) {
+        jclass callbackClass = env->GetObjectClass(callback);
+        progressMethod = env->GetMethodID(callbackClass, "onProgress", 
+                                          "(IILjava/lang/String;F)V");
+    }
+    
+    // Process
+    PipelineResult result;
+    pipeline->process(
+        frames, grayFrames, selectedRef,
+        gyroHomographies.empty() ? nullptr : &gyroHomographies,
+        result,
+        [&](int tile, int total, const char* msg, float progress) {
+            if (callback && progressMethod) {
+                jstring jMsg = env->NewStringUTF(msg);
+                env->CallVoidMethod(callback, progressMethod, tile, total, jMsg, progress);
+                env->DeleteLocalRef(jMsg);
+            }
+        }
+    );
+    
+    // Free frame memory as soon as possible
+    frames.clear();
+    grayFrames.clear();
+    
+    if (!result.success) {
+        LOGE("MFSR processing failed");
+        return -5;
+    }
+    
+    // Copy result to output bitmap
+    AndroidBitmapInfo outInfo;
+    if (AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to get output bitmap info");
+        return -6;
+    }
+    
+    if (outInfo.width != static_cast<uint32_t>(result.outputWidth) ||
+        outInfo.height != static_cast<uint32_t>(result.outputHeight)) {
+        LOGE("Output bitmap size mismatch: expected %dx%d, got %dx%d",
+             result.outputWidth, result.outputHeight, outInfo.width, outInfo.height);
+        return -7;
+    }
+    
+    void* outPixels;
+    if (AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to lock output bitmap");
+        return -8;
+    }
+    
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < result.outputHeight; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < result.outputWidth; ++x) {
+            const RGBPixel& p = result.outputImage.at(x, y);
+            int idx = x * 4;
+            row[idx + 0] = 255;  // Alpha
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("MFSR (YUV) complete: %dx%d -> %dx%d, ref=%d, tiles=%d, time=%.1fs, fallback=%s",
+         result.inputWidth, result.inputHeight,
+         result.outputWidth, result.outputHeight,
+         selectedRef, result.tilesProcessed, result.processingTimeMs / 1000.0f,
+         result.usedFallback ? "yes" : "no");
+    
+    // Return selected reference index (useful for preview)
+    return selectedRef;
+}
+
+/**
+ * Select the best reference frame based on gyro stability
+ * Returns the index of the frame with lowest total gyro rotation
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeSelectReferenceFrame(
+    JNIEnv* env,
+    jclass clazz,
+    jfloatArray gyroMagnitudes
+) {
+    int numFrames = env->GetArrayLength(gyroMagnitudes);
+    if (numFrames < 1) return 0;
+    
+    jfloat* mags = env->GetFloatArrayElements(gyroMagnitudes, nullptr);
+    
+    int bestIdx = 0;
+    float minMag = mags[0];
+    for (int i = 1; i < numFrames; ++i) {
+        if (mags[i] < minMag) {
+            minMag = mags[i];
+            bestIdx = i;
+        }
+    }
+    
+    env->ReleaseFloatArrayElements(gyroMagnitudes, mags, JNI_ABORT);
+    
+    LOGD("Selected reference frame %d (gyro magnitude: %.4f)", bestIdx, minMag);
+    return bestIdx;
+}
+
 } // extern "C"

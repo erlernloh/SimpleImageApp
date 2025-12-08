@@ -41,6 +41,7 @@ data class UltraDetailUiState(
     val processingProgress: Float = 0f,
     val statusMessage: String = "",
     val resultBitmap: Bitmap? = null,
+    val previewBitmap: Bitmap? = null,  // Quick preview shown immediately after capture
     val savedUri: Uri? = null,
     val processingTimeMs: Long = 0,
     val framesUsed: Int = 0,
@@ -49,6 +50,7 @@ data class UltraDetailUiState(
     val mfsrApplied: Boolean = false,
     val mfsrScaleFactor: Int = 1,
     val mfsrCoveragePercent: Float = 0f,
+    val refinementStrength: Float = 0.7f,  // Tunable: 0=original, 1=fully refined
     val error: String? = null
 )
 
@@ -106,6 +108,18 @@ class UltraDetailViewModel @Inject constructor(
     }
     
     /**
+     * Set the refinement blend strength (ULTRA preset only)
+     * 
+     * @param strength 0.0 = original MFSR output, 1.0 = fully refined
+     */
+    fun setRefinementStrength(strength: Float) {
+        _uiState.value = _uiState.value.copy(
+            refinementStrength = strength.coerceIn(0f, 1f)
+        )
+        Log.d(TAG, "Refinement strength set to: $strength")
+    }
+    
+    /**
      * Start burst capture and processing
      */
     fun startCapture(burstController: BurstCaptureController) {
@@ -143,16 +157,29 @@ class UltraDetailViewModel @Inject constructor(
                     return@launch
                 }
                 
+                val preset = _uiState.value.selectedPreset
+                
+                // For ULTRA preset, generate quick preview immediately
+                var previewBitmap: Bitmap? = null
+                if (preset == UltraDetailPreset.ULTRA) {
+                    previewBitmap = pipeline?.generateQuickPreview(frames)
+                }
+                
                 _uiState.value = _uiState.value.copy(
                     isCapturing = false,
                     isProcessing = true,
                     processingProgress = 0f,
-                    statusMessage = "Processing..."
+                    statusMessage = "Processing...",
+                    previewBitmap = previewBitmap  // Show preview while processing
                 )
                 
                 // Initialize pipeline with selected preset
-                val preset = _uiState.value.selectedPreset
                 pipeline?.initialize(preset)
+                
+                // Set refinement strength for ULTRA preset
+                if (preset == UltraDetailPreset.ULTRA) {
+                    pipeline?.setRefinementStrength(_uiState.value.refinementStrength)
+                }
                 
                 // Process frames
                 val result = pipeline?.process(frames, preset, viewModelScope)

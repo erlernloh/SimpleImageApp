@@ -185,6 +185,20 @@ class UltraDetailPipeline(
     }
     
     /**
+     * Set refinement blend strength (ULTRA preset only)
+     * 
+     * @param strength 0.0 = original MFSR output, 1.0 = fully refined
+     */
+    fun setRefinementStrength(strength: Float) {
+        mfsrRefiner?.setBlendStrength(strength)
+    }
+    
+    /**
+     * Get current refinement blend strength
+     */
+    fun getRefinementStrength(): Float = mfsrRefiner?.getBlendStrength() ?: 0.7f
+    
+    /**
      * Process captured burst frames
      * 
      * @param frames List of captured YUV frames
@@ -395,6 +409,9 @@ class UltraDetailPipeline(
     
     /**
      * Process frames using ULTRA preset (MFSR + neural refinement)
+     * 
+     * Uses direct YUV processing to avoid ~360MB memory spike from RGB conversion.
+     * Auto-selects the most stable frame (lowest gyro rotation) as reference.
      */
     private suspend fun processUltraPreset(
         frames: List<CapturedFrame>,
@@ -410,37 +427,22 @@ class UltraDetailPipeline(
         
         Log.i(TAG, "Processing ${frames.size} frames with ULTRA preset: ${width}x${height} -> ${outputWidth}x${outputHeight}")
         
-        // Stage 1: Convert YUV frames to RGB bitmaps
-        _state.value = PipelineState.ProcessingBurst(
-            ProcessingStage.CONVERTING_YUV, 0f, "Converting frames..."
-        )
-        
-        val rgbBitmaps = frames.mapIndexed { index, frame ->
-            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            convertYUVToBitmap(frame, bitmap)
-            _state.value = PipelineState.ProcessingBurst(
-                ProcessingStage.CONVERTING_YUV,
-                (index + 1).toFloat() / frames.size,
-                "Converting frame ${index + 1}/${frames.size}"
-            )
-            bitmap
-        }.toTypedArray()
-        
-        // Stage 2: Compute gyro homographies
+        // Stage 1: Compute gyro homographies
         _state.value = PipelineState.ProcessingBurst(
             ProcessingStage.ALIGNING_FRAMES, 0f, "Computing gyro alignment..."
         )
         
         val homographies = gyroHelper.computeAllHomographies(frames)
         
-        // Stage 3: Process through MFSR pipeline
+        // Stage 2: Process through MFSR pipeline (direct YUV - saves ~360MB RAM)
         _state.value = PipelineState.ProcessingMFSR(0, 0, 0f)
         
         val outputBitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
         
-        val mfsrResult = pipeline.processBitmaps(
-            inputBitmaps = rgbBitmaps,
-            referenceIndex = frames.size / 2,
+        // Use -1 for referenceIndex to auto-select the most stable frame
+        val mfsrResult = pipeline.processYUV(
+            frames = frames,
+            referenceIndex = -1,  // Auto-select: lowest gyro rotation
             homographies = homographies,
             outputBitmap = outputBitmap,
             progressCallback = object : MFSRProgressCallback {
@@ -450,10 +452,8 @@ class UltraDetailPipeline(
             }
         )
         
-        // Cleanup input bitmaps
-        rgbBitmaps.forEach { it.recycle() }
-        
-        if (mfsrResult != 0) {
+        // mfsrResult >= 0 is the selected reference index, < 0 is error
+        if (mfsrResult < 0) {
             Log.e(TAG, "MFSR processing failed with code: $mfsrResult")
             _state.value = PipelineState.Error("MFSR processing failed", outputBitmap)
             return UltraDetailResult(
@@ -469,7 +469,10 @@ class UltraDetailPipeline(
             )
         }
         
-        // Stage 4: Neural refinement (optional)
+        val selectedRefIndex = mfsrResult
+        Log.d(TAG, "MFSR used reference frame $selectedRefIndex")
+        
+        // Stage 3: Neural refinement (optional)
         val finalBitmap = if (mfsrRefiner?.isReady() == true) {
             _state.value = PipelineState.RefiningMFSR(0, 0)
             
@@ -511,6 +514,134 @@ class UltraDetailPipeline(
             mfsrScaleFactor = scaleFactor,
             mfsrCoveragePercent = 100f
         )
+    }
+    
+    /**
+     * Generate a quick preview bitmap from the reference frame.
+     * Shows the user what was captured immediately, before full processing.
+     * 
+     * @param frames List of captured frames
+     * @return Preview bitmap (center crop of best frame), or null on failure
+     */
+    suspend fun generateQuickPreview(frames: List<CapturedFrame>): Bitmap? = withContext(Dispatchers.Default) {
+        if (frames.isEmpty()) return@withContext null
+        
+        try {
+            // Select the most stable frame (lowest gyro rotation)
+            val bestFrameIndex = selectBestFrame(frames)
+            val bestFrame = frames[bestFrameIndex]
+            
+            // Create a smaller preview (center crop, 1/4 size)
+            val previewWidth = bestFrame.width / 2
+            val previewHeight = bestFrame.height / 2
+            val offsetX = bestFrame.width / 4
+            val offsetY = bestFrame.height / 4
+            
+            val preview = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.ARGB_8888)
+            convertYUVToBitmapCrop(bestFrame, preview, offsetX, offsetY, previewWidth, previewHeight)
+            
+            // Rotate to match final output orientation
+            val rotated = rotateBitmap(preview, 90f)
+            if (rotated !== preview) {
+                preview.recycle()
+            }
+            
+            Log.d(TAG, "Generated quick preview from frame $bestFrameIndex: ${rotated.width}x${rotated.height}")
+            rotated
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to generate preview", e)
+            null
+        }
+    }
+    
+    /**
+     * Select the best frame based on gyro stability (lowest total rotation)
+     */
+    private fun selectBestFrame(frames: List<CapturedFrame>): Int {
+        if (frames.size <= 1) return 0
+        
+        var bestIndex = 0
+        var minRotation = Float.MAX_VALUE
+        
+        frames.forEachIndexed { index, frame ->
+            val rotation = computeGyroMagnitude(frame.gyroSamples)
+            if (rotation < minRotation) {
+                minRotation = rotation
+                bestIndex = index
+            }
+        }
+        
+        Log.d(TAG, "Selected best frame: $bestIndex (gyro magnitude: $minRotation)")
+        return bestIndex
+    }
+    
+    /**
+     * Compute total gyro rotation magnitude from samples
+     */
+    private fun computeGyroMagnitude(samples: List<GyroSample>): Float {
+        if (samples.size < 2) return 0f
+        
+        var totalRotation = 0f
+        for (i in 1 until samples.size) {
+            val dt = (samples[i].timestamp - samples[i - 1].timestamp) / 1e9f
+            val avgX = (samples[i].rotationX + samples[i - 1].rotationX) * 0.5f
+            val avgY = (samples[i].rotationY + samples[i - 1].rotationY) * 0.5f
+            val avgZ = (samples[i].rotationZ + samples[i - 1].rotationZ) * 0.5f
+            
+            val mag = kotlin.math.sqrt((avgX * avgX + avgY * avgY + avgZ * avgZ).toDouble()).toFloat() * dt
+            totalRotation += mag
+        }
+        
+        return totalRotation
+    }
+    
+    /**
+     * Convert a cropped region of YUV CapturedFrame to RGB Bitmap
+     */
+    private fun convertYUVToBitmapCrop(
+        frame: CapturedFrame, 
+        output: Bitmap,
+        offsetX: Int,
+        offsetY: Int,
+        cropWidth: Int,
+        cropHeight: Int
+    ) {
+        val pixels = IntArray(cropWidth * cropHeight)
+        
+        val yBuffer = frame.yPlane
+        val uBuffer = frame.uPlane
+        val vBuffer = frame.vPlane
+        
+        yBuffer.rewind()
+        uBuffer.rewind()
+        vBuffer.rewind()
+        
+        for (y in 0 until cropHeight) {
+            for (x in 0 until cropWidth) {
+                val srcX = offsetX + x
+                val srcY = offsetY + y
+                
+                val yIndex = srcY * frame.yRowStride + srcX
+                val uvIndex = (srcY / 2) * frame.uvRowStride + (srcX / 2) * frame.uvPixelStride
+                
+                val yVal = (yBuffer.get(yIndex).toInt() and 0xFF) - 16
+                val uVal = (uBuffer.get(uvIndex).toInt() and 0xFF) - 128
+                val vVal = (vBuffer.get(uvIndex).toInt() and 0xFF) - 128
+                
+                var r = (1.164f * yVal + 1.596f * vVal).toInt()
+                var g = (1.164f * yVal - 0.813f * vVal - 0.391f * uVal).toInt()
+                var b = (1.164f * yVal + 2.018f * uVal).toInt()
+                
+                r = r.coerceIn(0, 255)
+                g = g.coerceIn(0, 255)
+                b = b.coerceIn(0, 255)
+                
+                pixels[y * cropWidth + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        
+        output.setPixels(pixels, 0, cropWidth, 0, 0, cropWidth, cropHeight)
     }
     
     /**

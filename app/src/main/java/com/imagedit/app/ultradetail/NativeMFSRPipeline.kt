@@ -8,6 +8,7 @@ package com.imagedit.app.ultradetail
 
 import android.graphics.Bitmap
 import android.util.Log
+import java.nio.ByteBuffer
 
 private const val TAG = "NativeMFSRPipeline"
 
@@ -89,7 +90,102 @@ class NativeMFSRPipeline private constructor(
         progressCallback: MFSRProgressCallback? = null
     ): Int {
         // Convert Homography objects to flat float array
-        val homArray = homographies?.let { homs ->
+        val homArray = homographiesToFloatArray(homographies)
+        return processBitmaps(inputBitmaps, referenceIndex, homArray, outputBitmap, progressCallback)
+    }
+    
+    /**
+     * Process YUV frames directly through the MFSR pipeline.
+     * This avoids the ~360MB memory spike from converting all frames to RGB upfront.
+     * 
+     * @param frames List of captured frames with YUV data
+     * @param referenceIndex Index of reference frame, or -1 for auto-select (lowest gyro rotation)
+     * @param homographies Optional gyro homographies
+     * @param outputBitmap Pre-allocated output bitmap (scaled size)
+     * @param progressCallback Optional progress callback
+     * @return Selected reference index on success, negative error code on failure
+     */
+    fun processYUV(
+        frames: List<CapturedFrame>,
+        referenceIndex: Int = -1,  // -1 = auto-select best frame
+        homographies: List<Homography>?,
+        outputBitmap: Bitmap,
+        progressCallback: MFSRProgressCallback? = null
+    ): Int {
+        check(nativeHandle != 0L) { "Pipeline has been destroyed" }
+        
+        val numFrames = frames.size
+        if (numFrames < 2) {
+            Log.e(TAG, "Need at least 2 frames for MFSR")
+            return -2
+        }
+        
+        // Prepare YUV plane arrays
+        val yPlanes = frames.map { it.yPlane }.toTypedArray()
+        val uPlanes = frames.map { it.uPlane }.toTypedArray()
+        val vPlanes = frames.map { it.vPlane }.toTypedArray()
+        val yRowStrides = frames.map { it.yRowStride }.toIntArray()
+        val uvRowStrides = frames.map { it.uvRowStride }.toIntArray()
+        val uvPixelStrides = frames.map { it.uvPixelStride }.toIntArray()
+        
+        val width = frames[0].width
+        val height = frames[0].height
+        
+        // Convert homographies to flat array
+        val homArray = homographiesToFloatArray(homographies)
+        
+        // Compute gyro magnitudes for smart reference selection
+        val gyroMagnitudes = frames.map { frame ->
+            computeGyroMagnitude(frame.gyroSamples)
+        }.toFloatArray()
+        
+        Log.d(TAG, "Processing $numFrames YUV frames (${width}x${height}), " +
+                   "ref=${if (referenceIndex < 0) "auto" else referenceIndex}")
+        
+        return nativeProcessYUV(
+            nativeHandle,
+            yPlanes,
+            uPlanes,
+            vPlanes,
+            yRowStrides,
+            uvRowStrides,
+            uvPixelStrides,
+            width,
+            height,
+            referenceIndex,
+            homArray,
+            gyroMagnitudes,
+            outputBitmap,
+            progressCallback
+        )
+    }
+    
+    /**
+     * Compute total gyro rotation magnitude from samples
+     */
+    private fun computeGyroMagnitude(samples: List<GyroSample>): Float {
+        if (samples.size < 2) return 0f
+        
+        var totalRotation = 0f
+        for (i in 1 until samples.size) {
+            val dt = (samples[i].timestamp - samples[i - 1].timestamp) / 1e9f
+            val avgX = (samples[i].rotationX + samples[i - 1].rotationX) * 0.5f
+            val avgY = (samples[i].rotationY + samples[i - 1].rotationY) * 0.5f
+            val avgZ = (samples[i].rotationZ + samples[i - 1].rotationZ) * 0.5f
+            
+            // Magnitude of rotation during this interval
+            val mag = kotlin.math.sqrt((avgX * avgX + avgY * avgY + avgZ * avgZ).toDouble()).toFloat() * dt
+            totalRotation += mag
+        }
+        
+        return totalRotation
+    }
+    
+    /**
+     * Convert Homography list to flat float array
+     */
+    private fun homographiesToFloatArray(homographies: List<Homography>?): FloatArray? {
+        return homographies?.let { homs ->
             FloatArray(homs.size * 9) { i ->
                 val homIdx = i / 9
                 val elemIdx = i % 9
@@ -108,8 +204,6 @@ class NativeMFSRPipeline private constructor(
                 }
             }
         }
-        
-        return processBitmaps(inputBitmaps, referenceIndex, homArray, outputBitmap, progressCallback)
     }
     
     override fun close() {
@@ -130,6 +224,23 @@ class NativeMFSRPipeline private constructor(
         inputBitmaps: Array<Bitmap>,
         referenceIndex: Int,
         homographies: FloatArray?,
+        outputBitmap: Bitmap,
+        callback: MFSRProgressCallback?
+    ): Int
+    
+    private external fun nativeProcessYUV(
+        handle: Long,
+        yPlanes: Array<ByteBuffer>,
+        uPlanes: Array<ByteBuffer>,
+        vPlanes: Array<ByteBuffer>,
+        yRowStrides: IntArray,
+        uvRowStrides: IntArray,
+        uvPixelStrides: IntArray,
+        width: Int,
+        height: Int,
+        referenceIndex: Int,
+        homographies: FloatArray?,
+        gyroMagnitudes: FloatArray,
         outputBitmap: Bitmap,
         callback: MFSRProgressCallback?
     ): Int
