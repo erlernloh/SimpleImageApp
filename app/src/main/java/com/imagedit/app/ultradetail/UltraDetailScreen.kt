@@ -192,6 +192,8 @@ fun UltraDetailScreen(
                     detailTiles = uiState.detailTilesCount,
                     srTiles = uiState.srTilesProcessed,
                     preset = uiState.selectedPreset,
+                    mfsrApplied = uiState.mfsrApplied,
+                    mfsrScaleFactor = uiState.mfsrScaleFactor,
                     isSaving = uiState.isSaving,
                     isSaved = uiState.savedUri != null,
                     onSave = { 
@@ -210,6 +212,22 @@ fun UltraDetailScreen(
                     },
                     modifier = Modifier.fillMaxSize()
                 )
+                
+                // ULTRA mode settings panel (refinement strength)
+                AnimatedVisibility(
+                    visible = uiState.selectedPreset == UltraDetailPreset.ULTRA && 
+                              !uiState.isCapturing && !uiState.isProcessing,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
+                ) {
+                    UltraSettingsPanel(
+                        refinementStrength = uiState.refinementStrength,
+                        onRefinementStrengthChange = { viewModel.setRefinementStrength(it) }
+                    )
+                }
                 
                 // Capture controls
                 CaptureControls(
@@ -263,10 +281,10 @@ private fun PresetSelector(
         ) {
             Text(
                 text = when (selectedPreset) {
-                    UltraDetailPreset.FAST -> "Fast"
-                    UltraDetailPreset.BALANCED -> "Balanced"
-                    UltraDetailPreset.MAX -> "Max"
-                    UltraDetailPreset.ULTRA -> "Ultra"
+                    UltraDetailPreset.FAST -> "⚡ Quick"
+                    UltraDetailPreset.BALANCED -> "✨ Balanced"
+                    UltraDetailPreset.MAX -> "🔍 Maximum"
+                    UltraDetailPreset.ULTRA -> "🚀 Ultra"
                 }
             )
             Icon(Icons.Default.ArrowDropDown, contentDescription = null)
@@ -279,8 +297,10 @@ private fun PresetSelector(
             DropdownMenuItem(
                 text = {
                     Column {
-                        Text("Fast", fontWeight = FontWeight.Bold)
-                        Text("Burst merge only", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("⚡ Quick", fontWeight = FontWeight.Bold)
+                        Text("Fast noise reduction • 6 photos", 
+                            style = MaterialTheme.typography.bodySmall, 
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 },
                 onClick = {
@@ -291,8 +311,10 @@ private fun PresetSelector(
             DropdownMenuItem(
                 text = {
                     Column {
-                        Text("Balanced", fontWeight = FontWeight.Bold)
-                        Text("Merge + edge detection", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("✨ Balanced", fontWeight = FontWeight.Bold)
+                        Text("Better details & less noise • 8 photos", 
+                            style = MaterialTheme.typography.bodySmall, 
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 },
                 onClick = {
@@ -303,8 +325,10 @@ private fun PresetSelector(
             DropdownMenuItem(
                 text = {
                     Column {
-                        Text("Max", fontWeight = FontWeight.Bold)
-                        Text("Full pipeline with SR", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("🔍 Maximum", fontWeight = FontWeight.Bold)
+                        Text("AI-enhanced sharpness • 12 photos", 
+                            style = MaterialTheme.typography.bodySmall, 
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 },
                 onClick = {
@@ -315,8 +339,10 @@ private fun PresetSelector(
             DropdownMenuItem(
                 text = {
                     Column {
-                        Text("Ultra", fontWeight = FontWeight.Bold)
-                        Text("MFSR 2x + AI refinement", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("🚀 Ultra Resolution", fontWeight = FontWeight.Bold)
+                        Text("2× larger image with AI polish • 10 photos", 
+                            style = MaterialTheme.typography.bodySmall, 
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 },
                 onClick = {
@@ -402,23 +428,38 @@ private fun CaptureControls(
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Preset indicator
-                Text(
-                    text = when (preset) {
-                        UltraDetailPreset.FAST -> "6 frames"
-                        UltraDetailPreset.BALANCED -> "8 frames"
-                        UltraDetailPreset.MAX -> "12 frames + SR"
-                        UltraDetailPreset.ULTRA -> "10 frames + MFSR 2x"
-                    },
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
-                    style = MaterialTheme.typography.bodySmall,
+                // Preset indicator with user-friendly description
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier
                         .background(
-                            MaterialTheme.colorScheme.surface.copy(alpha = 0.8f),
-                            RoundedCornerShape(16.dp)
+                            MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                            RoundedCornerShape(12.dp)
                         )
-                        .padding(horizontal = 12.dp, vertical = 4.dp)
-                )
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        text = when (preset) {
+                            UltraDetailPreset.FAST -> "⚡ Quick Mode"
+                            UltraDetailPreset.BALANCED -> "✨ Balanced Mode"
+                            UltraDetailPreset.MAX -> "🔍 Maximum Mode"
+                            UltraDetailPreset.ULTRA -> "🚀 Ultra Resolution"
+                        },
+                        color = MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = when (preset) {
+                            UltraDetailPreset.FAST -> "Takes 6 photos • ~2 sec"
+                            UltraDetailPreset.BALANCED -> "Takes 8 photos • ~3 sec"
+                            UltraDetailPreset.MAX -> "Takes 12 photos • ~5 sec"
+                            UltraDetailPreset.ULTRA -> "Takes 10 photos • 2× resolution • ~8 sec"
+                        },
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
                 
                 Spacer(modifier = Modifier.height(8.dp))
                 
@@ -459,6 +500,8 @@ private fun ResultView(
     detailTiles: Int,
     srTiles: Int,
     preset: UltraDetailPreset,
+    mfsrApplied: Boolean = false,
+    mfsrScaleFactor: Int = 1,
     isSaving: Boolean = false,
     isSaved: Boolean = false,
     onSave: () -> Unit,
@@ -475,7 +518,7 @@ private fun ResultView(
                 .fillMaxWidth()
         )
         
-        // Stats card
+        // Stats card with user-friendly descriptions
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -484,32 +527,81 @@ private fun ResultView(
             Column(
                 modifier = Modifier.padding(16.dp)
             ) {
+                // Title based on preset
                 Text(
-                    text = "Ultra Detail+ Result",
+                    text = when (preset) {
+                        UltraDetailPreset.FAST -> "⚡ Quick Capture Complete"
+                        UltraDetailPreset.BALANCED -> "✨ Balanced Capture Complete"
+                        UltraDetailPreset.MAX -> "🔍 Maximum Detail Complete"
+                        UltraDetailPreset.ULTRA -> "🚀 Ultra Resolution Complete"
+                    },
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
                 
-                Spacer(modifier = Modifier.height(8.dp))
+                // Subtitle explaining what was done
+                Text(
+                    text = when (preset) {
+                        UltraDetailPreset.FAST -> "Noise reduced by combining $framesUsed photos"
+                        UltraDetailPreset.BALANCED -> "Enhanced details from $framesUsed photos"
+                        UltraDetailPreset.MAX -> "AI-sharpened from $framesUsed photos"
+                        UltraDetailPreset.ULTRA -> "Resolution doubled using $framesUsed photos + AI polish"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
                 
+                Spacer(modifier = Modifier.height(12.dp))
+                
+                // Main stats row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    StatItem("Time", "${processingTimeMs}ms")
-                    StatItem("Frames", "$framesUsed")
-                    StatItem("Resolution", "${bitmap.width}x${bitmap.height}")
+                    StatItem("⏱️ Time", formatTime(processingTimeMs))
+                    StatItem("📷 Photos", "$framesUsed")
+                    StatItem("📐 Size", formatResolution(bitmap.width, bitmap.height))
                 }
                 
-                if (preset == UltraDetailPreset.MAX) {
+                // ULTRA preset specific info
+                if (preset == UltraDetailPreset.ULTRA && mfsrApplied) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    
+                    // MFSR explanation card
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = "🎯 Super-Resolution Applied",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                            Text(
+                                text = "Your image was enlarged ${mfsrScaleFactor}× using multi-frame " +
+                                       "super-resolution. Fine details were recovered by analyzing " +
+                                       "sub-pixel differences between photos.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+                    }
+                }
+                
+                // MAX preset specific info
+                if (preset == UltraDetailPreset.MAX && srTiles > 0) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        StatItem("Detail tiles", "$detailTiles")
-                        StatItem("SR tiles", "$srTiles")
-                        StatItem("Preset", "Max")
+                        StatItem("🧩 Detail areas", "$detailTiles")
+                        StatItem("✨ AI enhanced", "$srTiles")
                     }
                 }
             }
@@ -575,6 +667,117 @@ private fun StatItem(label: String, value: String) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+    }
+}
+
+/**
+ * Settings panel for ULTRA mode with refinement strength slider
+ */
+@Composable
+private fun UltraSettingsPanel(
+    refinementStrength: Float,
+    onRefinementStrengthChange: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
+        ),
+        modifier = modifier.padding(horizontal = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            // Header with info icon
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "🎨 AI Polish Strength",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    text = "${(refinementStrength * 100).toInt()}%",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            
+            // Description
+            Text(
+                text = "Controls how much AI enhancement is applied to the final image",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+            )
+            
+            // Slider with labels
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "Natural",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                Slider(
+                    value = refinementStrength,
+                    onValueChange = onRefinementStrengthChange,
+                    valueRange = 0f..1f,
+                    steps = 9,  // 0%, 10%, 20%, ... 100%
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 8.dp)
+                )
+                
+                Text(
+                    text = "Enhanced",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            
+            // Hint based on current value
+            Text(
+                text = when {
+                    refinementStrength < 0.3f -> "💡 Minimal AI polish - preserves original look"
+                    refinementStrength < 0.6f -> "💡 Moderate polish - balanced enhancement"
+                    refinementStrength < 0.85f -> "💡 Strong polish - sharper details (recommended)"
+                    else -> "💡 Maximum polish - most AI enhancement"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
+                modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+    }
+}
+
+/**
+ * Format processing time in a user-friendly way
+ */
+private fun formatTime(ms: Long): String {
+    return when {
+        ms < 1000 -> "${ms}ms"
+        ms < 60000 -> String.format("%.1fs", ms / 1000.0)
+        else -> String.format("%.1fm", ms / 60000.0)
+    }
+}
+
+/**
+ * Format resolution in a user-friendly way (e.g., "12MP" or "4032×3024")
+ */
+private fun formatResolution(width: Int, height: Int): String {
+    val megapixels = (width.toLong() * height) / 1_000_000.0
+    return when {
+        megapixels >= 1.0 -> String.format("%.1fMP", megapixels)
+        else -> "${width}×${height}"
     }
 }
 
