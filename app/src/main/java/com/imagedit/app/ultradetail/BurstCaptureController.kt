@@ -106,7 +106,19 @@ data class CapturedFrame(
         }
         
         private fun copyToDirectBuffer(source: ByteBuffer): ByteBuffer {
-            val copy = ByteBuffer.allocateDirect(source.remaining())
+            // Check available memory before allocating
+            val runtime = Runtime.getRuntime()
+            val usedMemory = runtime.totalMemory() - runtime.freeMemory()
+            val maxMemory = runtime.maxMemory()
+            val availableMemory = maxMemory - usedMemory
+            val requiredBytes = source.remaining()
+            
+            // If less than 20% memory available and buffer is large, request GC
+            if (availableMemory < maxMemory * 0.2 && requiredBytes > 100_000) {
+                System.gc()
+            }
+            
+            val copy = ByteBuffer.allocateDirect(requiredBytes)
             copy.put(source)
             copy.rewind()
             return copy
@@ -225,7 +237,12 @@ class BurstCaptureController(
         
         isCapturing = true
         capturedFrames.clear()
-        frameChannel = Channel(Channel.UNLIMITED)
+        
+        // Use bounded channel to prevent memory overflow
+        frameChannel = Channel(config.frameCount + 2)
+        
+        // Request GC before capture to free up memory
+        System.gc()
         
         _captureState.value = BurstCaptureState.Capturing(0, config.frameCount)
         
@@ -402,7 +419,7 @@ class BurstCaptureController(
     
     /**
      * Start recording gyroscope data
-     * Uses SENSOR_DELAY_FASTEST for ~200Hz sampling rate
+     * Tries SENSOR_DELAY_FASTEST (~200Hz) first, falls back to SENSOR_DELAY_GAME (~50Hz)
      */
     private fun startGyroRecording() {
         if (gyroscope == null) {
@@ -414,16 +431,33 @@ class BurstCaptureController(
         isGyroRecording = true
         lastFrameTimestamp = 0
         
-        // Register at fastest rate for accurate motion tracking
-        val registered = sensorManager.registerListener(
-            this,
-            gyroscope,
-            SensorManager.SENSOR_DELAY_FASTEST
-        )
+        // Try fastest rate first (requires HIGH_SAMPLING_RATE_SENSORS permission on Android 12+)
+        var registered = try {
+            sensorManager.registerListener(
+                this,
+                gyroscope,
+                SensorManager.SENSOR_DELAY_FASTEST
+            )
+        } catch (e: SecurityException) {
+            Log.w(TAG, "SENSOR_DELAY_FASTEST not permitted, trying SENSOR_DELAY_GAME")
+            false
+        }
         
-        if (registered) {
-            Log.d(TAG, "Gyroscope recording started (SENSOR_DELAY_FASTEST)")
+        // Fallback to game rate if fastest fails
+        if (!registered) {
+            registered = sensorManager.registerListener(
+                this,
+                gyroscope,
+                SensorManager.SENSOR_DELAY_GAME  // ~50Hz, doesn't require special permission
+            )
+            if (registered) {
+                Log.d(TAG, "Gyroscope recording started (SENSOR_DELAY_GAME fallback)")
+            }
         } else {
+            Log.d(TAG, "Gyroscope recording started (SENSOR_DELAY_FASTEST)")
+        }
+        
+        if (!registered) {
             Log.e(TAG, "Failed to register gyroscope listener")
             isGyroRecording = false
         }

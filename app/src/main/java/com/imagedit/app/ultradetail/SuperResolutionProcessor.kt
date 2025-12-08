@@ -295,8 +295,12 @@ class SuperResolutionProcessor(
     private fun processTileWithSR(tile: Bitmap): Bitmap {
         val interp = interpreter ?: return processTileWithBicubic(tile)
         
-        // Pad tile to model's input size if needed (may be non-square)
-        val paddedTile = if (tile.width < inputWidth || tile.height < inputHeight) {
+        // Validate buffer exists
+        val inBuf = inputBuffer ?: return processTileWithBicubic(tile)
+        val outBuf = outputBuffer ?: return processTileWithBicubic(tile)
+        
+        // Always create a properly sized tile matching model input dimensions
+        val paddedTile = if (tile.width != inputWidth || tile.height != inputHeight) {
             val padded = Bitmap.createBitmap(inputWidth, inputHeight, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(padded)
             canvas.drawBitmap(tile, 0f, 0f, null)
@@ -305,8 +309,16 @@ class SuperResolutionProcessor(
             tile
         }
         
+        // Verify buffer capacity matches expected size
+        val expectedBytes = inputHeight * inputWidth * 3 * 4  // float32 RGB
+        if (inBuf.capacity() != expectedBytes) {
+            Log.e(TAG, "Buffer size mismatch: buffer=${inBuf.capacity()}, expected=$expectedBytes")
+            if (paddedTile !== tile) paddedTile.recycle()
+            return processTileWithBicubic(tile)
+        }
+        
         // Fill input buffer (height x width order for TFLite)
-        inputBuffer?.rewind()
+        inBuf.rewind()
         for (y in 0 until inputHeight) {
             for (x in 0 until inputWidth) {
                 val pixel = paddedTile.getPixel(x, y)
@@ -314,25 +326,25 @@ class SuperResolutionProcessor(
                 val g = ((pixel shr 8) and 0xFF) / 255f
                 val b = (pixel and 0xFF) / 255f
                 
-                inputBuffer?.putFloat(r)
-                inputBuffer?.putFloat(g)
-                inputBuffer?.putFloat(b)
+                inBuf.putFloat(r)
+                inBuf.putFloat(g)
+                inBuf.putFloat(b)
             }
         }
         
         // Run inference
-        outputBuffer?.rewind()
-        interp.run(inputBuffer, outputBuffer)
+        outBuf.rewind()
+        interp.run(inBuf, outBuf)
         
         // Create output bitmap (non-square)
         val output = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
-        outputBuffer?.rewind()
+        outBuf.rewind()
         
         for (y in 0 until outputHeight) {
             for (x in 0 until outputWidth) {
-                val r = (outputBuffer?.float?.coerceIn(0f, 1f) ?: 0f) * 255
-                val g = (outputBuffer?.float?.coerceIn(0f, 1f) ?: 0f) * 255
-                val b = (outputBuffer?.float?.coerceIn(0f, 1f) ?: 0f) * 255
+                val r = (outBuf.float.coerceIn(0f, 1f)) * 255
+                val g = (outBuf.float.coerceIn(0f, 1f)) * 255
+                val b = (outBuf.float.coerceIn(0f, 1f)) * 255
                 
                 val pixel = (0xFF shl 24) or
                            (r.toInt() shl 16) or
