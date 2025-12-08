@@ -381,6 +381,9 @@ void TiledMFSRPipeline::processTile(
     float totalFlow = 0.0f;
     int validFlows = 0;
     
+    // Threshold for skipping optical flow (use gyro-only for small motions)
+    const float GYRO_ONLY_THRESHOLD = 0.5f;  // pixels
+    
     for (int i = 0; i < numFrames; ++i) {
         if (i == referenceIndex) {
             // Reference has zero flow
@@ -393,12 +396,23 @@ void TiledMFSRPipeline::processTile(
             continue;
         }
         
-        // Compute flow with optional gyro initialization
+        // Get gyro initialization
         GyroHomography gyroInit;
+        bool hasGyro = false;
         if (gyroHomographies && config_.useGyroInit && i < static_cast<int>(gyroHomographies->size())) {
             gyroInit = (*gyroHomographies)[i];
+            hasGyro = gyroInit.isValid;
         }
         
+        // NOTE: We removed the gyro-only fast path optimization because:
+        // 1. On emulators, gyro data is often all zeros (unreliable)
+        // 2. Even with "zero" gyro motion, there's still natural hand shake
+        // 3. Optical flow is needed to detect sub-pixel motion for MFSR to work
+        // 
+        // The optical flow with gyro initialization is still faster than without,
+        // because the search radius is reduced when gyro is available.
+        
+        // Compute dense optical flow for larger motions
         DenseFlowResult flowResult;
         flowResult = flowProcessor_->computeFlow(grayTileCrops[i], gyroInit);
         

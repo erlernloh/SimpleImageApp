@@ -50,7 +50,7 @@ struct TilePipelineConfig {
         TUKEY           // Tukey biweight (aggressive outlier rejection)
     };
     RobustnessMethod robustness = RobustnessMethod::TUKEY;
-    float robustnessThreshold = 0.1f;  // Color difference threshold
+    float robustnessThreshold = 0.2f;  // Color difference threshold (increased for better brightness)
     
     // Memory limits
     size_t maxMemoryMB = 200;     // Target max memory per tile
@@ -61,8 +61,10 @@ struct TilePipelineConfig {
     
     TilePipelineConfig() {
         mfsrParams.scaleFactor = scaleFactor;
-        flowParams.pyramidLevels = 3;  // Fewer levels for tiles
-        flowParams.windowSize = 11;
+        // Optimized for speed while maintaining quality
+        flowParams.pyramidLevels = 2;  // Fewer levels for faster processing
+        flowParams.windowSize = 9;     // Smaller window for speed
+        flowParams.maxIterations = 5;  // Fewer iterations
     }
 };
 

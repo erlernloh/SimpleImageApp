@@ -29,6 +29,18 @@ import javax.inject.Inject
 private const val TAG = "UltraDetailViewModel"
 
 /**
+ * UI processing stage for progress display
+ */
+enum class UiProcessingStage {
+    IDLE,
+    CAPTURING,
+    ALIGNING,
+    SUPER_RESOLUTION,
+    REFINING,
+    FINALIZING
+}
+
+/**
  * UI state for Ultra Detail+ screen
  */
 data class UltraDetailUiState(
@@ -40,6 +52,11 @@ data class UltraDetailUiState(
     val captureProgress: Float = 0f,
     val processingProgress: Float = 0f,
     val statusMessage: String = "",
+    val processingStage: UiProcessingStage = UiProcessingStage.IDLE,
+    val processingStartTimeMs: Long = 0,
+    val estimatedTotalTimeMs: Long = 60000,  // Default 60 seconds for ULTRA
+    val currentTile: Int = 0,
+    val totalTiles: Int = 0,
     val resultBitmap: Bitmap? = null,
     val previewBitmap: Bitmap? = null,  // Quick preview shown immediately after capture
     val savedUri: Uri? = null,
@@ -163,13 +180,27 @@ class UltraDetailViewModel @Inject constructor(
                 var previewBitmap: Bitmap? = null
                 if (preset == UltraDetailPreset.ULTRA) {
                     previewBitmap = pipeline?.generateQuickPreview(frames)
+                    // Start foreground service to prevent app from being killed
+                    ProcessingService.start(context)
+                }
+                
+                val estimatedTime = when (preset) {
+                    UltraDetailPreset.FAST -> 2000L
+                    UltraDetailPreset.BALANCED -> 3000L
+                    UltraDetailPreset.MAX -> 5000L
+                    UltraDetailPreset.ULTRA -> 90000L  // ~90 seconds for ULTRA
                 }
                 
                 _uiState.value = _uiState.value.copy(
                     isCapturing = false,
                     isProcessing = true,
                     processingProgress = 0f,
-                    statusMessage = "Processing...",
+                    processingStage = UiProcessingStage.ALIGNING,
+                    processingStartTimeMs = System.currentTimeMillis(),
+                    estimatedTotalTimeMs = estimatedTime,
+                    currentTile = 0,
+                    totalTiles = 0,
+                    statusMessage = "Aligning frames...",
                     previewBitmap = previewBitmap  // Show preview while processing
                 )
                 
@@ -182,12 +213,20 @@ class UltraDetailViewModel @Inject constructor(
                 }
                 
                 // Process frames
-                val result = pipeline?.process(frames, preset, viewModelScope)
+                val result = try {
+                    pipeline?.process(frames, preset, viewModelScope)
+                } finally {
+                    // Stop foreground service when done
+                    if (preset == UltraDetailPreset.ULTRA) {
+                        ProcessingService.stop(context)
+                    }
+                }
                 
                 if (result != null) {
                     val mfsrStatus = if (result.mfsrApplied) " (MFSR ${result.mfsrScaleFactor}x)" else ""
                     _uiState.value = _uiState.value.copy(
                         isProcessing = false,
+                        processingStage = UiProcessingStage.IDLE,
                         resultBitmap = result.bitmap,
                         processingTimeMs = result.processingTimeMs,
                         framesUsed = result.framesUsed,
@@ -201,6 +240,7 @@ class UltraDetailViewModel @Inject constructor(
                 } else {
                     _uiState.value = _uiState.value.copy(
                         isProcessing = false,
+                        processingStage = UiProcessingStage.IDLE,
                         error = "Processing failed"
                     )
                 }
@@ -361,6 +401,7 @@ class UltraDetailViewModel @Inject constructor(
             is PipelineState.ProcessingBurst -> {
                 _uiState.value = _uiState.value.copy(
                     processingProgress = state.progress,
+                    processingStage = UiProcessingStage.ALIGNING,
                     statusMessage = state.message
                 )
             }
@@ -371,12 +412,16 @@ class UltraDetailViewModel @Inject constructor(
                 
                 _uiState.value = _uiState.value.copy(
                     processingProgress = progress,
+                    processingStage = UiProcessingStage.SUPER_RESOLUTION,
+                    currentTile = state.tilesProcessed,
+                    totalTiles = state.totalTiles,
                     statusMessage = "Super-resolution: ${state.tilesProcessed}/${state.totalTiles} tiles"
                 )
             }
             is PipelineState.Complete -> {
                 _uiState.value = _uiState.value.copy(
                     isProcessing = false,
+                    processingStage = UiProcessingStage.IDLE,
                     resultBitmap = state.result,
                     processingTimeMs = state.processingTimeMs,
                     statusMessage = "Complete! ${state.processingTimeMs}ms"
@@ -385,6 +430,7 @@ class UltraDetailViewModel @Inject constructor(
             is PipelineState.Error -> {
                 _uiState.value = _uiState.value.copy(
                     isProcessing = false,
+                    processingStage = UiProcessingStage.IDLE,
                     error = state.message,
                     resultBitmap = state.fallbackResult
                 )

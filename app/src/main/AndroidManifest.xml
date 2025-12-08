@@ -12,6 +12,10 @@
         tools:ignore="ScopedStorage" />
     <!-- Required for high-frequency gyro sampling in ULTRA mode -->
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <!-- Required for foreground service during long ULTRA processing -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Hardware features -->
     <uses-feature android:name="android.hardware.camera" android:required="true" />
@@ -35,6 +39,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        
+        <!-- Foreground service for long-running ULTRA processing -->
+        <service
+            android:name=".ultradetail.ProcessingService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>

@@ -695,10 +695,11 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessBitmaps(
         for (int x = 0; x < result.outputWidth; ++x) {
             const RGBPixel& p = result.outputImage.at(x, y);
             int idx = x * 4;
-            row[idx + 0] = 255;  // Alpha
-            row[idx + 1] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
-            row[idx + 2] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
-            row[idx + 3] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            // Android ARGB_8888 format: R, G, B, A (in memory order)
+            row[idx + 0] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;  // Alpha
         }
     }
     
@@ -951,10 +952,11 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessYUV(
         for (int x = 0; x < result.outputWidth; ++x) {
             const RGBPixel& p = result.outputImage.at(x, y);
             int idx = x * 4;
-            row[idx + 0] = 255;  // Alpha
-            row[idx + 1] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
-            row[idx + 2] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
-            row[idx + 3] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            // Android ARGB_8888 format: R, G, B, A (in memory order)
+            row[idx + 0] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;  // Alpha
         }
     }
     

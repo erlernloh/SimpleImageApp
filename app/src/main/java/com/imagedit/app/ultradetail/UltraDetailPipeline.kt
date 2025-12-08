@@ -94,10 +94,12 @@ class UltraDetailPipeline(
             // ULTRA preset uses dedicated MFSR pipeline
             if (preset == UltraDetailPreset.ULTRA) {
                 // Initialize tile-based MFSR pipeline
+                // Use larger tiles (512x512) to reduce processing time
+                // This reduces tile count from ~20 to ~6 for a 1280x960 image
                 mfsrPipeline = NativeMFSRPipeline.create(NativeMFSRConfig(
-                    tileWidth = 256,
-                    tileHeight = 256,
-                    overlap = 32,
+                    tileWidth = 512,
+                    tileHeight = 512,
+                    overlap = 64,
                     scaleFactor = 2,
                     robustness = MFSRRobustness.TUKEY,
                     useGyroInit = true

@@ -116,7 +116,7 @@ fun UltraDetailScreen(
                         UltraDetailPreset.FAST -> 6
                         UltraDetailPreset.BALANCED -> 8
                         UltraDetailPreset.MAX -> 12
-                        UltraDetailPreset.ULTRA -> 10  // More frames for MFSR
+                        UltraDetailPreset.ULTRA -> 4  // Reduced for faster processing (4 frames is enough for MFSR)
                     },
                     targetResolution = Size(4000, 3000)
                 )
@@ -235,6 +235,11 @@ fun UltraDetailScreen(
                     isProcessing = uiState.isProcessing,
                     captureProgress = uiState.captureProgress,
                     processingProgress = uiState.processingProgress,
+                    processingStage = uiState.processingStage,
+                    processingStartTimeMs = uiState.processingStartTimeMs,
+                    estimatedTotalTimeMs = uiState.estimatedTotalTimeMs,
+                    currentTile = uiState.currentTile,
+                    totalTiles = uiState.totalTiles,
                     statusMessage = uiState.statusMessage,
                     preset = uiState.selectedPreset,
                     onCaptureClick = {
@@ -355,47 +360,193 @@ private fun PresetSelector(
 }
 
 /**
- * Capture controls overlay
+ * Encouraging messages shown during processing
  */
+private val encouragingMessages = listOf(
+    "Creating something beautiful...",
+    "Enhancing every detail...",
+    "Patience brings perfection...",
+    "Magic takes time...",
+    "Worth the wait...",
+    "Crafting your masterpiece...",
+    "Almost there...",
+    "Great things take time..."
+)
+
 @Composable
 private fun CaptureControls(
     isCapturing: Boolean,
     isProcessing: Boolean,
     captureProgress: Float,
     processingProgress: Float,
+    processingStage: UiProcessingStage,
+    processingStartTimeMs: Long,
+    estimatedTotalTimeMs: Long,
+    currentTile: Int,
+    totalTiles: Int,
     statusMessage: String,
     preset: UltraDetailPreset,
     onCaptureClick: () -> Unit,
     onCancelClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    // Calculate ETA
+    val currentTimeMs = remember { mutableLongStateOf(System.currentTimeMillis()) }
+    
+    // Update time every second when processing
+    LaunchedEffect(isProcessing) {
+        if (isProcessing) {
+            while (true) {
+                currentTimeMs.longValue = System.currentTimeMillis()
+                kotlinx.coroutines.delay(1000)
+            }
+        }
+    }
+    
+    val elapsedMs = if (processingStartTimeMs > 0) {
+        currentTimeMs.longValue - processingStartTimeMs
+    } else 0L
+    
+    val remainingMs = if (processingProgress > 0.05f && elapsedMs > 0) {
+        // Estimate based on actual progress
+        val estimatedTotal = (elapsedMs / processingProgress).toLong()
+        maxOf(0L, estimatedTotal - elapsedMs)
+    } else {
+        // Use default estimate
+        maxOf(0L, estimatedTotalTimeMs - elapsedMs)
+    }
+    
+    // Select encouraging message based on progress
+    val messageIndex = remember(processingProgress) {
+        (processingProgress * encouragingMessages.size).toInt().coerceIn(0, encouragingMessages.lastIndex)
+    }
+    
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = modifier
     ) {
-        // Status message
+        // Enhanced progress display for ULTRA preset
         AnimatedVisibility(
-            visible = statusMessage.isNotEmpty(),
+            visible = isProcessing && preset == UltraDetailPreset.ULTRA,
             enter = fadeIn(),
             exit = fadeOut()
         ) {
             Card(
                 colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
                 ),
-                modifier = Modifier.padding(bottom = 16.dp)
+                modifier = Modifier
+                    .padding(bottom = 16.dp)
+                    .widthIn(min = 280.dp)
             ) {
-                Text(
-                    text = statusMessage,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                )
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(20.dp)
+                ) {
+                    // Stage indicator
+                    Text(
+                        text = when (processingStage) {
+                            UiProcessingStage.CAPTURING -> "📷 Capturing..."
+                            UiProcessingStage.ALIGNING -> "🔄 Aligning frames..."
+                            UiProcessingStage.SUPER_RESOLUTION -> "✨ Enhancing resolution..."
+                            UiProcessingStage.REFINING -> "🎨 Refining details..."
+                            UiProcessingStage.FINALIZING -> "✅ Finalizing..."
+                            else -> "⏳ Processing..."
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    
+                    Spacer(modifier = Modifier.height(12.dp))
+                    
+                    // Progress bar
+                    LinearProgressIndicator(
+                        progress = { processingProgress },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(4.dp)),
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    // Progress percentage and tile info
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "${(processingProgress * 100).toInt()}%",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        
+                        if (totalTiles > 0) {
+                            Text(
+                                text = "Tile $currentTile / $totalTiles",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(12.dp))
+                    
+                    // ETA display
+                    val etaText = if (remainingMs > 60000) {
+                        val minutes = remainingMs / 60000
+                        val seconds = (remainingMs % 60000) / 1000
+                        "~${minutes}m ${seconds}s remaining"
+                    } else if (remainingMs > 0) {
+                        "~${remainingMs / 1000}s remaining"
+                    } else {
+                        "Almost done..."
+                    }
+                    
+                    Text(
+                        text = etaText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
+                    )
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    // Encouraging message
+                    Text(
+                        text = encouragingMessages[messageIndex],
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
+                        textAlign = TextAlign.Center,
+                        fontWeight = FontWeight.Medium
+                    )
+                    
+                    Spacer(modifier = Modifier.height(16.dp))
+                    
+                    // Cancel button
+                    OutlinedButton(
+                        onClick = onCancelClick,
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Cancel")
+                    }
+                }
             }
         }
         
-        // Progress indicator
+        // Simple progress for non-ULTRA presets or capturing
         AnimatedVisibility(
-            visible = isCapturing || isProcessing,
+            visible = (isCapturing || (isProcessing && preset != UltraDetailPreset.ULTRA)),
             enter = fadeIn(),
             exit = fadeOut()
         ) {
@@ -403,6 +554,19 @@ private fun CaptureControls(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.padding(bottom = 16.dp)
             ) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+                    ),
+                    modifier = Modifier.padding(bottom = 8.dp)
+                ) {
+                    Text(
+                        text = if (isCapturing) "Capturing frames..." else statusMessage,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
+                
                 LinearProgressIndicator(
                     progress = { if (isCapturing) captureProgress else processingProgress },
                     modifier = Modifier
@@ -454,7 +618,7 @@ private fun CaptureControls(
                             UltraDetailPreset.FAST -> "Takes 6 photos • ~2 sec"
                             UltraDetailPreset.BALANCED -> "Takes 8 photos • ~3 sec"
                             UltraDetailPreset.MAX -> "Takes 12 photos • ~5 sec"
-                            UltraDetailPreset.ULTRA -> "Takes 10 photos • 2× resolution • ~8 sec"
+                            UltraDetailPreset.ULTRA -> "Takes 4 photos • 2× resolution • ~60 sec"
                         },
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                         style = MaterialTheme.typography.bodySmall
