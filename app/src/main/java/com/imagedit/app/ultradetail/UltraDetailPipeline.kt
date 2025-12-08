@@ -28,7 +28,9 @@ enum class UltraDetailPreset {
     /** Stages 1 + 2: Burst merge + edge-aware detail mask */
     BALANCED,
     /** Stages 1 + 2 + 3: Full pipeline with super-resolution */
-    MAX
+    MAX,
+    /** Stage 4: Full MFSR pipeline with neural refinement (Ultra Detail 2.0) */
+    ULTRA
 }
 
 /**
@@ -39,6 +41,8 @@ sealed class PipelineState {
     data class CapturingBurst(val framesCollected: Int, val totalFrames: Int) : PipelineState()
     data class ProcessingBurst(val stage: ProcessingStage, val progress: Float, val message: String) : PipelineState()
     data class ApplyingSuperResolution(val tilesProcessed: Int, val totalTiles: Int) : PipelineState()
+    data class ProcessingMFSR(val tilesProcessed: Int, val totalTiles: Int, val progress: Float) : PipelineState()
+    data class RefiningMFSR(val tilesProcessed: Int, val totalTiles: Int) : PipelineState()
     data class Complete(val result: Bitmap, val processingTimeMs: Long) : PipelineState()
     data class Error(val message: String, val fallbackResult: Bitmap?) : PipelineState()
 }
@@ -73,6 +77,11 @@ class UltraDetailPipeline(
     private var nativeProcessor: NativeBurstProcessor? = null
     private var srProcessor: SuperResolutionProcessor? = null
     
+    // MFSR pipeline components (for ULTRA preset)
+    private var mfsrPipeline: NativeMFSRPipeline? = null
+    private var mfsrRefiner: MFSRRefiner? = null
+    private val gyroHelper = GyroAlignmentHelper()
+    
     private var currentJob: Job? = null
     
     /**
@@ -82,7 +91,41 @@ class UltraDetailPipeline(
      */
     suspend fun initialize(preset: UltraDetailPreset): Boolean = withContext(Dispatchers.IO) {
         try {
-            // Initialize native processor
+            // ULTRA preset uses dedicated MFSR pipeline
+            if (preset == UltraDetailPreset.ULTRA) {
+                // Initialize tile-based MFSR pipeline
+                mfsrPipeline = NativeMFSRPipeline.create(NativeMFSRConfig(
+                    tileWidth = 256,
+                    tileHeight = 256,
+                    overlap = 32,
+                    scaleFactor = 2,
+                    robustness = MFSRRobustness.TUKEY,
+                    useGyroInit = true
+                ))
+                
+                // Initialize neural refiner
+                try {
+                    mfsrRefiner = MFSRRefiner(context, RefinerConfig(
+                        tileSize = 128,
+                        overlap = 16,
+                        useGpu = true,
+                        blendStrength = 0.7f
+                    ))
+                    
+                    if (!mfsrRefiner!!.initialize()) {
+                        Log.w(TAG, "MFSR refiner initialization failed, will skip refinement")
+                        mfsrRefiner = null
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "MFSR refiner creation failed: ${e.message}")
+                    mfsrRefiner = null
+                }
+                
+                Log.i(TAG, "Pipeline initialized with ULTRA preset (MFSR + refinement)")
+                return@withContext true
+            }
+            
+            // Other presets use the original native processor
             val nativeParams = when (preset) {
                 UltraDetailPreset.FAST -> BurstProcessorParams(
                     pyramidLevels = 3,
@@ -103,6 +146,7 @@ class UltraDetailPipeline(
                     enableMFSR = true,        // Enable multi-frame super-resolution
                     mfsrScaleFactor = 2       // 2x upscale from stacked frames
                 )
+                UltraDetailPreset.ULTRA -> BurstProcessorParams() // Handled above
             }
             
             nativeProcessor = NativeBurstProcessor.create(nativeParams)
@@ -161,7 +205,13 @@ class UltraDetailPipeline(
             return@withContext null
         }
         
-        if (nativeProcessor == null) {
+        // Initialize if needed
+        val needsInit = when (preset) {
+            UltraDetailPreset.ULTRA -> mfsrPipeline == null
+            else -> nativeProcessor == null
+        }
+        
+        if (needsInit) {
             if (!initialize(preset)) {
                 _state.value = PipelineState.Error("Failed to initialize pipeline", null)
                 return@withContext null
@@ -172,6 +222,11 @@ class UltraDetailPipeline(
             // Get frame dimensions
             val width = frames[0].width
             val height = frames[0].height
+            
+            // ULTRA preset uses dedicated MFSR pipeline
+            if (preset == UltraDetailPreset.ULTRA) {
+                return@withContext processUltraPreset(frames, width, height, startTime)
+            }
             
             // Determine output size based on preset (MFSR for MAX preset)
             val mfsrScale = if (preset == UltraDetailPreset.MAX) 2 else 1
@@ -339,6 +394,167 @@ class UltraDetailPipeline(
     }
     
     /**
+     * Process frames using ULTRA preset (MFSR + neural refinement)
+     */
+    private suspend fun processUltraPreset(
+        frames: List<CapturedFrame>,
+        width: Int,
+        height: Int,
+        startTime: Long
+    ): UltraDetailResult? {
+        val pipeline = mfsrPipeline ?: return null
+        
+        val scaleFactor = 2
+        val outputWidth = width * scaleFactor
+        val outputHeight = height * scaleFactor
+        
+        Log.i(TAG, "Processing ${frames.size} frames with ULTRA preset: ${width}x${height} -> ${outputWidth}x${outputHeight}")
+        
+        // Stage 1: Convert YUV frames to RGB bitmaps
+        _state.value = PipelineState.ProcessingBurst(
+            ProcessingStage.CONVERTING_YUV, 0f, "Converting frames..."
+        )
+        
+        val rgbBitmaps = frames.mapIndexed { index, frame ->
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            convertYUVToBitmap(frame, bitmap)
+            _state.value = PipelineState.ProcessingBurst(
+                ProcessingStage.CONVERTING_YUV,
+                (index + 1).toFloat() / frames.size,
+                "Converting frame ${index + 1}/${frames.size}"
+            )
+            bitmap
+        }.toTypedArray()
+        
+        // Stage 2: Compute gyro homographies
+        _state.value = PipelineState.ProcessingBurst(
+            ProcessingStage.ALIGNING_FRAMES, 0f, "Computing gyro alignment..."
+        )
+        
+        val homographies = gyroHelper.computeAllHomographies(frames)
+        
+        // Stage 3: Process through MFSR pipeline
+        _state.value = PipelineState.ProcessingMFSR(0, 0, 0f)
+        
+        val outputBitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+        
+        val mfsrResult = pipeline.processBitmaps(
+            inputBitmaps = rgbBitmaps,
+            referenceIndex = frames.size / 2,
+            homographies = homographies,
+            outputBitmap = outputBitmap,
+            progressCallback = object : MFSRProgressCallback {
+                override fun onProgress(tilesProcessed: Int, totalTiles: Int, message: String, progress: Float) {
+                    _state.value = PipelineState.ProcessingMFSR(tilesProcessed, totalTiles, progress)
+                }
+            }
+        )
+        
+        // Cleanup input bitmaps
+        rgbBitmaps.forEach { it.recycle() }
+        
+        if (mfsrResult != 0) {
+            Log.e(TAG, "MFSR processing failed with code: $mfsrResult")
+            _state.value = PipelineState.Error("MFSR processing failed", outputBitmap)
+            return UltraDetailResult(
+                bitmap = outputBitmap,
+                processingTimeMs = System.currentTimeMillis() - startTime,
+                framesUsed = frames.size,
+                detailTilesCount = 0,
+                srTilesProcessed = 0,
+                preset = UltraDetailPreset.ULTRA,
+                mfsrApplied = false,
+                mfsrScaleFactor = scaleFactor,
+                mfsrCoveragePercent = 0f
+            )
+        }
+        
+        // Stage 4: Neural refinement (optional)
+        val finalBitmap = if (mfsrRefiner?.isReady() == true) {
+            _state.value = PipelineState.RefiningMFSR(0, 0)
+            
+            try {
+                mfsrRefiner!!.refine(outputBitmap) { processed, total, _ ->
+                    _state.value = PipelineState.RefiningMFSR(processed, total)
+                }.also {
+                    if (it !== outputBitmap) {
+                        outputBitmap.recycle()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Refinement failed, using MFSR output", e)
+                outputBitmap
+            }
+        } else {
+            outputBitmap
+        }
+        
+        // Apply rotation correction
+        val rotatedBitmap = rotateBitmap(finalBitmap, 90f)
+        if (rotatedBitmap !== finalBitmap) {
+            finalBitmap.recycle()
+        }
+        
+        val processingTime = System.currentTimeMillis() - startTime
+        _state.value = PipelineState.Complete(rotatedBitmap, processingTime)
+        
+        Log.i(TAG, "ULTRA pipeline complete: ${processingTime}ms, ${rotatedBitmap.width}x${rotatedBitmap.height}")
+        
+        return UltraDetailResult(
+            bitmap = rotatedBitmap,
+            processingTimeMs = processingTime,
+            framesUsed = frames.size,
+            detailTilesCount = 0,
+            srTilesProcessed = (width / 256) * (height / 256),
+            preset = UltraDetailPreset.ULTRA,
+            mfsrApplied = true,
+            mfsrScaleFactor = scaleFactor,
+            mfsrCoveragePercent = 100f
+        )
+    }
+    
+    /**
+     * Convert YUV CapturedFrame to RGB Bitmap
+     */
+    private fun convertYUVToBitmap(frame: CapturedFrame, output: Bitmap) {
+        val width = frame.width
+        val height = frame.height
+        val pixels = IntArray(width * height)
+        
+        val yBuffer = frame.yPlane
+        val uBuffer = frame.uPlane
+        val vBuffer = frame.vPlane
+        
+        yBuffer.rewind()
+        uBuffer.rewind()
+        vBuffer.rewind()
+        
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val yIndex = y * frame.yRowStride + x
+                val uvIndex = (y / 2) * frame.uvRowStride + (x / 2) * frame.uvPixelStride
+                
+                val yVal = (yBuffer.get(yIndex).toInt() and 0xFF) - 16
+                val uVal = (uBuffer.get(uvIndex).toInt() and 0xFF) - 128
+                val vVal = (vBuffer.get(uvIndex).toInt() and 0xFF) - 128
+                
+                // YUV to RGB conversion
+                var r = (1.164f * yVal + 1.596f * vVal).toInt()
+                var g = (1.164f * yVal - 0.813f * vVal - 0.391f * uVal).toInt()
+                var b = (1.164f * yVal + 2.018f * uVal).toInt()
+                
+                r = r.coerceIn(0, 255)
+                g = g.coerceIn(0, 255)
+                b = b.coerceIn(0, 255)
+                
+                pixels[y * width + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        
+        output.setPixels(pixels, 0, width, 0, 0, width, height)
+    }
+    
+    /**
      * Cancel ongoing processing
      */
     fun cancel() {
@@ -358,8 +574,12 @@ class UltraDetailPipeline(
         cancel()
         nativeProcessor?.close()
         srProcessor?.close()
+        mfsrPipeline?.close()
+        mfsrRefiner?.close()
         nativeProcessor = null
         srProcessor = null
+        mfsrPipeline = null
+        mfsrRefiner = null
     }
     
     /**

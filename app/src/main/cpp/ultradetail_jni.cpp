@@ -8,6 +8,7 @@
 #include <android/bitmap.h>
 #include "burst_processor.h"
 #include "yuv_converter.h"
+#include "tiled_pipeline.h"
 
 using namespace ultradetail;
 
@@ -485,6 +486,249 @@ Java_com_imagedit_app_ultradetail_NativeBurstProcessor_nativeComputeEdgeMask(
          mask.numDetailTiles, mask.numSmoothTiles);
     
     return mask.numDetailTiles;
+}
+
+// ============================================================================
+// TiledMFSRPipeline JNI bindings
+// ============================================================================
+
+/**
+ * Create a TiledMFSRPipeline instance
+ */
+JNIEXPORT jlong JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeCreate(
+    JNIEnv* env,
+    jclass clazz,
+    jint tileWidth,
+    jint tileHeight,
+    jint overlap,
+    jint scaleFactor,
+    jint robustnessMethod,
+    jfloat robustnessThreshold,
+    jboolean useGyroInit
+) {
+    TilePipelineConfig config;
+    config.tileWidth = tileWidth;
+    config.tileHeight = tileHeight;
+    config.overlap = overlap;
+    config.scaleFactor = scaleFactor;
+    config.robustness = static_cast<TilePipelineConfig::RobustnessMethod>(robustnessMethod);
+    config.robustnessThreshold = robustnessThreshold;
+    config.useGyroInit = useGyroInit;
+    
+    // Update MFSR params to match
+    config.mfsrParams.scaleFactor = scaleFactor;
+    
+    auto* pipeline = new TiledMFSRPipeline(config);
+    
+    LOGI("Created TiledMFSRPipeline: tile=%dx%d, overlap=%d, scale=%d",
+         tileWidth, tileHeight, overlap, scaleFactor);
+    
+    return reinterpret_cast<jlong>(pipeline);
+}
+
+/**
+ * Destroy a TiledMFSRPipeline instance
+ */
+JNIEXPORT void JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeDestroy(
+    JNIEnv* env,
+    jclass clazz,
+    jlong handle
+) {
+    auto* pipeline = reinterpret_cast<TiledMFSRPipeline*>(handle);
+    delete pipeline;
+    LOGD("TiledMFSRPipeline destroyed");
+}
+
+/**
+ * Process RGB bitmaps through the MFSR pipeline
+ * 
+ * @param handle Pipeline handle
+ * @param inputBitmaps Array of input Bitmap objects
+ * @param referenceIndex Index of reference frame
+ * @param homographies Flattened 3x3 homography matrices (9 floats per frame), or null
+ * @param outputBitmap Pre-allocated output bitmap (scaled size)
+ * @param callback Progress callback object
+ * @return Result code (0 = success)
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessBitmaps(
+    JNIEnv* env,
+    jobject thiz,
+    jlong handle,
+    jobjectArray inputBitmaps,
+    jint referenceIndex,
+    jfloatArray homographies,
+    jobject outputBitmap,
+    jobject callback
+) {
+    auto* pipeline = reinterpret_cast<TiledMFSRPipeline*>(handle);
+    if (!pipeline) {
+        LOGE("Invalid pipeline handle");
+        return -1;
+    }
+    
+    int numFrames = env->GetArrayLength(inputBitmaps);
+    if (numFrames < 2) {
+        LOGE("Need at least 2 frames for MFSR");
+        return -2;
+    }
+    
+    // Get first bitmap info
+    jobject firstBitmap = env->GetObjectArrayElement(inputBitmaps, 0);
+    AndroidBitmapInfo bitmapInfo;
+    if (AndroidBitmap_getInfo(env, firstBitmap, &bitmapInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to get bitmap info");
+        return -3;
+    }
+    
+    int width = bitmapInfo.width;
+    int height = bitmapInfo.height;
+    
+    LOGI("Processing %d frames (%dx%d) through MFSR pipeline", numFrames, width, height);
+    
+    // Convert bitmaps to RGBImage format
+    std::vector<RGBImage> frames(numFrames);
+    std::vector<GrayImage> grayFrames(numFrames);
+    
+    for (int i = 0; i < numFrames; ++i) {
+        jobject bitmap = env->GetObjectArrayElement(inputBitmaps, i);
+        
+        void* pixels;
+        if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+            LOGE("Failed to lock bitmap %d", i);
+            return -4;
+        }
+        
+        frames[i].resize(width, height);
+        grayFrames[i].resize(width, height);
+        
+        uint8_t* src = static_cast<uint8_t*>(pixels);
+        for (int y = 0; y < height; ++y) {
+            uint8_t* row = src + y * bitmapInfo.stride;
+            for (int x = 0; x < width; ++x) {
+                int idx = x * 4;
+                float r = row[idx + 1] / 255.0f;
+                float g = row[idx + 2] / 255.0f;
+                float b = row[idx + 3] / 255.0f;
+                
+                frames[i].at(x, y) = RGBPixel(r, g, b);
+                grayFrames[i].at(x, y) = 0.299f * r + 0.587f * g + 0.114f * b;
+            }
+        }
+        
+        AndroidBitmap_unlockPixels(env, bitmap);
+    }
+    
+    // Parse homographies if provided
+    std::vector<GyroHomography> gyroHomographies;
+    if (homographies != nullptr) {
+        int homLen = env->GetArrayLength(homographies);
+        if (homLen >= numFrames * 9) {
+            jfloat* homData = env->GetFloatArrayElements(homographies, nullptr);
+            
+            for (int i = 0; i < numFrames; ++i) {
+                GyroHomography gh;
+                for (int j = 0; j < 9; ++j) {
+                    gh.h[j] = homData[i * 9 + j];
+                }
+                gh.isValid = true;
+                gyroHomographies.push_back(gh);
+            }
+            
+            env->ReleaseFloatArrayElements(homographies, homData, JNI_ABORT);
+        }
+    }
+    
+    // Setup progress callback
+    jmethodID progressMethod = nullptr;
+    if (callback != nullptr) {
+        jclass callbackClass = env->GetObjectClass(callback);
+        progressMethod = env->GetMethodID(callbackClass, "onProgress", 
+                                          "(IILjava/lang/String;F)V");
+    }
+    
+    // Process
+    PipelineResult result;
+    pipeline->process(
+        frames, grayFrames, referenceIndex,
+        gyroHomographies.empty() ? nullptr : &gyroHomographies,
+        result,
+        [&](int tile, int total, const char* msg, float progress) {
+            if (callback && progressMethod) {
+                jstring jMsg = env->NewStringUTF(msg);
+                env->CallVoidMethod(callback, progressMethod, tile, total, jMsg, progress);
+                env->DeleteLocalRef(jMsg);
+            }
+        }
+    );
+    
+    if (!result.success) {
+        LOGE("MFSR processing failed");
+        return -5;
+    }
+    
+    // Copy result to output bitmap
+    AndroidBitmapInfo outInfo;
+    if (AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to get output bitmap info");
+        return -6;
+    }
+    
+    if (outInfo.width != static_cast<uint32_t>(result.outputWidth) ||
+        outInfo.height != static_cast<uint32_t>(result.outputHeight)) {
+        LOGE("Output bitmap size mismatch: expected %dx%d, got %dx%d",
+             result.outputWidth, result.outputHeight, outInfo.width, outInfo.height);
+        return -7;
+    }
+    
+    void* outPixels;
+    if (AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to lock output bitmap");
+        return -8;
+    }
+    
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < result.outputHeight; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < result.outputWidth; ++x) {
+            const RGBPixel& p = result.outputImage.at(x, y);
+            int idx = x * 4;
+            row[idx + 0] = 255;  // Alpha
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("MFSR complete: %dx%d -> %dx%d, tiles=%d, time=%.1fs, fallback=%s",
+         result.inputWidth, result.inputHeight,
+         result.outputWidth, result.outputHeight,
+         result.tilesProcessed, result.processingTimeMs / 1000.0f,
+         result.usedFallback ? "yes" : "no");
+    
+    return 0;
+}
+
+/**
+ * Get result info from last processing
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeGetResultInfo(
+    JNIEnv* env,
+    jobject thiz,
+    jlong handle,
+    jfloatArray outputInfo
+) {
+    // outputInfo: [inputWidth, inputHeight, outputWidth, outputHeight, 
+    //              tilesProcessed, tilesFailed, averageFlow, processingTimeMs, usedFallback]
+    
+    // This would need to store the last result in the pipeline
+    // For now, return success
+    return 0;
 }
 
 } // extern "C"

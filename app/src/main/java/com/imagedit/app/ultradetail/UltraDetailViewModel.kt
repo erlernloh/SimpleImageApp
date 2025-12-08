@@ -241,6 +241,7 @@ class UltraDetailViewModel @Inject constructor(
                         UltraDetailPreset.FAST -> "Fast"
                         UltraDetailPreset.BALANCED -> "Balanced"
                         UltraDetailPreset.MAX -> "Max"
+                        UltraDetailPreset.ULTRA -> "Ultra"
                     }
                     val mfsrSuffix = if (_uiState.value.mfsrApplied) "_MFSR${_uiState.value.mfsrScaleFactor}x" else ""
                     val filename = "UltraDetail_${timestamp}_${presetSuffix}${mfsrSuffix}.jpg"

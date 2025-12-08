@@ -116,6 +116,7 @@ fun UltraDetailScreen(
                         UltraDetailPreset.FAST -> 6
                         UltraDetailPreset.BALANCED -> 8
                         UltraDetailPreset.MAX -> 12
+                        UltraDetailPreset.ULTRA -> 10  // More frames for MFSR
                     },
                     targetResolution = Size(4000, 3000)
                 )
@@ -265,6 +266,7 @@ private fun PresetSelector(
                     UltraDetailPreset.FAST -> "Fast"
                     UltraDetailPreset.BALANCED -> "Balanced"
                     UltraDetailPreset.MAX -> "Max"
+                    UltraDetailPreset.ULTRA -> "Ultra"
                 }
             )
             Icon(Icons.Default.ArrowDropDown, contentDescription = null)
@@ -307,6 +309,18 @@ private fun PresetSelector(
                 },
                 onClick = {
                     onPresetSelected(UltraDetailPreset.MAX)
+                    expanded = false
+                }
+            )
+            DropdownMenuItem(
+                text = {
+                    Column {
+                        Text("Ultra", fontWeight = FontWeight.Bold)
+                        Text("MFSR 2x + AI refinement", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                },
+                onClick = {
+                    onPresetSelected(UltraDetailPreset.ULTRA)
                     expanded = false
                 }
             )
@@ -394,6 +408,7 @@ private fun CaptureControls(
                         UltraDetailPreset.FAST -> "6 frames"
                         UltraDetailPreset.BALANCED -> "8 frames"
                         UltraDetailPreset.MAX -> "12 frames + SR"
+                        UltraDetailPreset.ULTRA -> "10 frames + MFSR 2x"
                     },
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
                     style = MaterialTheme.typography.bodySmall,
