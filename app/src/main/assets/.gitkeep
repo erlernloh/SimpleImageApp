@@ -1,0 +1,3 @@
+# Assets directory for TFLite models
+# Place sr_model_x2.tflite here for 2x super-resolution
+# Place sr_model_x4.tflite here for 4x super-resolution

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Photara</string>
+    
+    <!-- Navigation -->
+    <string name="nav_camera">Camera</string>
+    <string name="nav_gallery">Gallery</string>
+    <string name="nav_editor">Editor</string>
+    <string name="nav_settings">Settings</string>
+    
+    <!-- Camera Screen -->
+    <string name="camera_capture">Capture</string>
+    <string name="camera_flash_auto">Auto Flash</string>
+    <string name="camera_flash_on">Flash On</string>
+    <string name="camera_flash_off">Flash Off</string>
+    <string name="camera_switch">Switch Camera</string>
+    
+    <!-- Editor Screen -->
+    <string name="editor_save">Save</string>
+    <string name="editor_undo">Undo</string>
+    <string name="editor_redo">Redo</string>
+    <string name="editor_reset">Reset</string>
+    <string name="editor_compare">Compare</string>
+    
+    <!-- Permissions -->
+    <string name="permission_camera_rationale">Camera permission is required to capture photos</string>
+    <string name="permission_storage_rationale">Storage permission is required to save photos</string>
+    <string name="permission_denied">Permission denied</string>
+    
+    <!-- Common -->
+    <string name="ok">OK</string>
+    <string name="cancel">Cancel</string>
+    <string name="delete">Delete</string>
+    <string name="share">Share</string>
+    <string name="loading">Loading…</string>
+    <string name="error">Error</string>
+</resources>
