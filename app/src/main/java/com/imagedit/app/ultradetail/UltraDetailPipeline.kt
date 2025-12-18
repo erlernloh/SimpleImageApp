@@ -867,24 +867,50 @@ class UltraDetailPipeline(
                 }
                 
                 // Step 3: Drizzle sub-pixel enhancement (if we have multiple aligned frames)
+                // Note: Drizzle works best with sub-pixel shifts. We extract the fractional
+                // part of the translation to get sub-pixel offsets for interlacing.
                 if (correctedFrames.size >= 3) {
                     Log.i(TAG, "║ Stage 3.5c: Drizzle sub-pixel enhancement...")
                     
                     // Use Drizzle to combine sub-pixel information from aligned frames
+                    // Output size matches MFSR output (already 2x scaled)
                     val drizzleOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
                     val drizzleConfig = DrizzleConfig(
                         scaleFactor = 2,
-                        pixfrac = 0.7f
+                        pixfrac = 0.8f  // Slightly larger drops for better coverage
                     )
                     
-                    // Convert homographies to sub-pixel shifts (extract translation component)
-                    val shifts = homographies.map { h ->
-                        SubPixelShift(
-                            dx = h.m02,  // Translation X
-                            dy = h.m12,  // Translation Y
-                            weight = 1.0f
-                        )
+                    // Convert homographies to sub-pixel shifts
+                    // Use fractional part of translation for sub-pixel interlacing
+                    // If homographies are identity (no motion), use synthetic dither pattern
+                    val shifts = homographies.mapIndexed { idx, h ->
+                        val fracX = h.m02 - kotlin.math.floor(h.m02)
+                        val fracY = h.m12 - kotlin.math.floor(h.m12)
+                        
+                        // Check if we have actual sub-pixel motion
+                        val hasMotion = kotlin.math.abs(fracX) > 0.01 || kotlin.math.abs(fracY) > 0.01
+                        
+                        if (hasMotion) {
+                            SubPixelShift(
+                                dx = fracX.toFloat(),
+                                dy = fracY.toFloat(),
+                                weight = 1.0f
+                            )
+                        } else {
+                            // Generate synthetic sub-pixel dither pattern (Bayer-like)
+                            // This creates sub-pixel diversity for Drizzle when camera is stable
+                            val n = correctedFrames.size
+                            val angle = 2.0 * kotlin.math.PI * idx / n
+                            val radius = 0.4  // Sub-pixel radius for dithering
+                            SubPixelShift(
+                                dx = (radius * kotlin.math.cos(angle)).toFloat(),
+                                dy = (radius * kotlin.math.sin(angle)).toFloat(),
+                                weight = 1.0f
+                            )
+                        }
                     }
+                    
+                    Log.d(TAG, "║   - Drizzle shifts: ${shifts.map { "(%.2f, %.2f)".format(it.dx, it.dy) }}")
                     
                     try {
                         if (applyDrizzle(
