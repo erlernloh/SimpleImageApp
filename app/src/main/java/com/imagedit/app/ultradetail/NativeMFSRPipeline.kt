@@ -29,8 +29,8 @@ data class NativeMFSRConfig(
     val tileHeight: Int = 256,
     val overlap: Int = 32,
     val scaleFactor: Int = 2,
-    val robustness: MFSRRobustness = MFSRRobustness.TUKEY,
-    val robustnessThreshold: Float = 0.1f,
+    val robustness: MFSRRobustness = MFSRRobustness.HUBER,  // HUBER is gentler than TUKEY for low-diversity frames
+    val robustnessThreshold: Float = 0.8f,  // Higher threshold allows more frame contribution
     val useGyroInit: Boolean = true
 )
 
@@ -92,6 +92,58 @@ class NativeMFSRPipeline private constructor(
         // Convert Homography objects to flat float array
         val homArray = homographiesToFloatArray(homographies)
         return processBitmaps(inputBitmaps, referenceIndex, homArray, outputBitmap, progressCallback)
+    }
+    
+    /**
+     * Process bitmaps with quality mask for pixel weighting
+     * 
+     * @param inputBitmaps Array of input bitmaps (burst frames)
+     * @param referenceIndex Index of the reference frame
+     * @param homographies Optional gyro homographies
+     * @param qualityMask Per-pixel quality weights (0-1), same size as input frames
+     * @param outputBitmap Pre-allocated output bitmap (scaled size)
+     * @param progressCallback Optional progress callback
+     * @return Result code (0 = success)
+     */
+    fun processBitmapsWithQualityMask(
+        inputBitmaps: Array<Bitmap>,
+        referenceIndex: Int = inputBitmaps.size / 2,
+        homographies: List<Homography>?,
+        qualityMask: FloatArray?,
+        maskWidth: Int,
+        maskHeight: Int,
+        outputBitmap: Bitmap,
+        progressCallback: MFSRProgressCallback? = null
+    ): Int {
+        check(nativeHandle != 0L) { "Pipeline has been destroyed" }
+        
+        val homArray = homographiesToFloatArray(homographies)
+        
+        // If quality mask is provided, use the new native method
+        if (qualityMask != null && qualityMask.isNotEmpty()) {
+            Log.d(TAG, "Processing with quality mask: ${maskWidth}x${maskHeight} (${qualityMask.size} pixels)")
+            return nativeProcessBitmapsWithMask(
+                nativeHandle,
+                inputBitmaps,
+                referenceIndex,
+                homArray,
+                qualityMask,
+                maskWidth,
+                maskHeight,
+                outputBitmap,
+                progressCallback
+            )
+        } else {
+            // Fall back to standard processing
+            return nativeProcessBitmaps(
+                nativeHandle,
+                inputBitmaps,
+                referenceIndex,
+                homArray,
+                outputBitmap,
+                progressCallback
+            )
+        }
     }
     
     /**
@@ -228,6 +280,18 @@ class NativeMFSRPipeline private constructor(
         callback: MFSRProgressCallback?
     ): Int
     
+    private external fun nativeProcessBitmapsWithMask(
+        handle: Long,
+        inputBitmaps: Array<Bitmap>,
+        referenceIndex: Int,
+        homographies: FloatArray?,
+        qualityMask: FloatArray,
+        maskWidth: Int,
+        maskHeight: Int,
+        outputBitmap: Bitmap,
+        callback: MFSRProgressCallback?
+    ): Int
+    
     private external fun nativeProcessYUV(
         handle: Long,
         yPlanes: Array<ByteBuffer>,
@@ -251,14 +315,37 @@ class NativeMFSRPipeline private constructor(
     ): Int
     
     companion object {
+        private var libraryLoaded = false
+        private var libraryLoadError: String? = null
+        
         init {
-            System.loadLibrary("ultradetail")
+            try {
+                System.loadLibrary("ultradetail")
+                libraryLoaded = true
+            } catch (e: UnsatisfiedLinkError) {
+                libraryLoadError = "Native MFSR library not available: ${e.message}"
+                Log.e(TAG, libraryLoadError!!)
+            }
         }
         
         /**
+         * Check if native library is available
+         */
+        fun isAvailable(): Boolean = libraryLoaded
+        
+        /**
+         * Get library load error message if any
+         */
+        fun getLoadError(): String? = libraryLoadError
+        
+        /**
          * Create a new MFSR pipeline
+         * @throws IllegalStateException if native library is not available
          */
         fun create(config: NativeMFSRConfig = NativeMFSRConfig()): NativeMFSRPipeline {
+            if (!libraryLoaded) {
+                throw IllegalStateException(libraryLoadError ?: "Native MFSR library not loaded")
+            }
             val handle = nativeCreate(
                 config.tileWidth,
                 config.tileHeight,

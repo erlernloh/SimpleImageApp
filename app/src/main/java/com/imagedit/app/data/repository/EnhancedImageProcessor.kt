@@ -1316,10 +1316,11 @@ class EnhancedImageProcessor @Inject constructor(
         bitmap: Bitmap, 
         brushStrokes: List<BrushStroke>, 
         brushSettings: HealingBrush, 
-        mode: ProcessingMode
+        mode: ProcessingMode,
+        progressCallback: ((Float) -> Unit)?
     ): Result<HealingResult> = withContext(Dispatchers.Default) {
         try {
-            val result = healingTool.healWithBrush(bitmap, brushStrokes, brushSettings, mode)
+            val result = healingTool.healWithBrush(bitmap, brushStrokes, brushSettings, mode, progressCallback)
             result
         } catch (e: Exception) {
             Result.failure(SmartProcessingError.AlgorithmFailure("healing_brush", e))

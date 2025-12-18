@@ -34,6 +34,7 @@ fun HealingToolPanel(
     onCancel: () -> Unit,
     hasStrokes: Boolean,
     isProcessing: Boolean,
+    healingProgress: Float = 0f,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -159,6 +160,31 @@ fun HealingToolPanel(
             
             Divider()
             
+            // Progress indicator when processing
+            if (isProcessing) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "Healing in progress... ${(healingProgress * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LinearProgressIndicator(
+                        progress = { healingProgress.coerceIn(0f, 1f) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(4.dp)),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+            }
+            
             // Action buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -180,11 +206,17 @@ fun HealingToolPanel(
                     enabled = hasStrokes && !isProcessing
                 ) {
                     if (isProcessing) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            strokeWidth = 2.dp,
-                            color = MaterialTheme.colorScheme.onPrimary
-                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary
+                            )
+                            Text("${(healingProgress * 100).toInt()}%")
+                        }
                     } else {
                         Text("Apply Healing")
                     }

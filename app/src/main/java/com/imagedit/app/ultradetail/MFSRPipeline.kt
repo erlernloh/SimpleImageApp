@@ -40,8 +40,8 @@ data class MFSRPipelineConfig(
     val flowWindowSize: Int = 11,       // Lucas-Kanade window size
     
     // Robustness settings
-    val robustnessMethod: RobustnessMethod = RobustnessMethod.TUKEY,
-    val robustnessThreshold: Float = 0.1f,
+    val robustnessMethod: RobustnessMethod = RobustnessMethod.HUBER,  // HUBER is gentler than TUKEY
+    val robustnessThreshold: Float = 0.8f,  // Higher threshold allows more frame contribution
     
     // Refinement settings
     val enableRefinement: Boolean = true,

@@ -44,7 +44,8 @@ android {
             }
         }
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            // ARM for physical devices, x86_64 for emulators
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
     }
     
@@ -131,9 +132,8 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.3.1")
     implementation("androidx.camera:camera-view:1.3.1")
 
-    // Image Loading
+    // Image Loading (using Coil for Compose)
     implementation("io.coil-kt:coil-compose:2.5.0")
-    implementation("com.github.bumptech.glide:glide:4.15.1")
 
     // DataStore
     implementation("androidx.datastore:datastore-preferences:1.0.0")

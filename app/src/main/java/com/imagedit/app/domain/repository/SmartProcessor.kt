@@ -59,13 +59,15 @@ interface SmartProcessor {
      * @param brushStrokes List of brush strokes defining areas to heal
      * @param brushSettings Brush configuration settings
      * @param mode Processing quality mode
+     * @param progressCallback Optional callback for progress updates (0.0 to 1.0)
      * @return HealingResult containing the healed image and operation details
      */
     suspend fun healWithBrush(
         bitmap: Bitmap, 
         brushStrokes: List<BrushStroke>, 
         brushSettings: HealingBrush, 
-        mode: ProcessingMode
+        mode: ProcessingMode,
+        progressCallback: ((Float) -> Unit)? = null
     ): Result<HealingResult>
     
     /**

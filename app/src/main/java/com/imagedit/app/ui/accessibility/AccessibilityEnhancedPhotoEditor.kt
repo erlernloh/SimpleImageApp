@@ -29,7 +29,7 @@ fun AccessibilityEnhancedPhotoEditor(
             .keyboardNavigationSupport(
                 onSmartEnhance = { viewModel.applySmartEnhancement() },
                 onPortraitEnhance = { viewModel.togglePortraitEnhancement() },
-                onLandscapeEnhance = { /* viewModel.toggleLandscapeEnhancement() */ },
+                onLandscapeEnhance = { viewModel.toggleLandscapeEnhancement() },
                 onHealingTool = { 
                     if (viewModel.uiState.value.isHealingToolActive) {
                         viewModel.deactivateHealingTool()
@@ -84,7 +84,7 @@ private fun handleVoiceCommand(
         }
         
         VoiceCommand.EnhanceLandscape -> {
-            // viewModel.toggleLandscapeEnhancement()
+            viewModel.toggleLandscapeEnhancement()
             AccessibilityUtils.announceForAccessibility(
                 context,
                 "Applying landscape enhancement",
@@ -111,12 +111,20 @@ private fun handleVoiceCommand(
         }
         
         VoiceCommand.ApplyHealing -> {
-            // This would trigger healing application
-            AccessibilityUtils.announceForAccessibility(
-                context,
-                "Applying healing to selected areas",
-                1
-            )
+            if (viewModel.hasHealingStrokes()) {
+                viewModel.applyHealing()
+                AccessibilityUtils.announceForAccessibility(
+                    context,
+                    "Applying healing to selected areas",
+                    1
+                )
+            } else {
+                AccessibilityUtils.announceForAccessibility(
+                    context,
+                    "No healing strokes to apply. Paint over areas first.",
+                    1
+                )
+            }
         }
         
         VoiceCommand.Undo -> {
@@ -130,7 +138,7 @@ private fun handleVoiceCommand(
         
         VoiceCommand.Clear -> {
             if (viewModel.uiState.value.isHealingToolActive) {
-                // Clear healing strokes
+                viewModel.clearHealingStrokes()
                 AccessibilityUtils.announceForAccessibility(
                     context,
                     "Clearing healing strokes",

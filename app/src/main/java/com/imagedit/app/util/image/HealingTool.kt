@@ -5,6 +5,7 @@ import com.imagedit.app.domain.model.*
 import com.imagedit.app.util.PerformanceManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.max
 import kotlin.math.min
 import com.imagedit.app.domain.model.HealingBrush as HealingBrushModel
@@ -21,9 +22,10 @@ class HealingTool(
     private val healingBrush = HealingBrush()
     
     companion object {
-        private const val MAX_AREA_SIZE = 10000 // Maximum pixels for healing area
+        private const val MAX_AREA_SIZE = 500000 // Maximum pixels for healing area (e.g., ~700x700)
         private const val MIN_SIMILARITY_THRESHOLD = 0.6f
         private const val EDGE_PROXIMITY_THRESHOLD = 50 // Pixels from edge
+        private const val HEALING_TIMEOUT_MS = 30000L // 30 second timeout to prevent ANR
     }
 
     /**
@@ -165,12 +167,16 @@ class HealingTool(
                 )
             }
             
-            // Perform texture synthesis healing with batching for large areas
-            val healedBitmap = if (targetArea.width() * targetArea.height() > MAX_AREA_SIZE / 2) {
-                performBatchedHealing(optimizedBitmap, targetArea, maskBitmap, mode, progressCallback, cancellationToken)
-            } else {
-                textureSynthesizer.synthesizeTexture(optimizedBitmap, targetArea, maskBitmap)
-            }
+            // Perform texture synthesis healing with timeout to prevent ANR
+            val healedBitmap = withTimeoutOrNull(HEALING_TIMEOUT_MS) {
+                if (targetArea.width() * targetArea.height() > MAX_AREA_SIZE / 2) {
+                    performBatchedHealing(optimizedBitmap, targetArea, maskBitmap, mode, progressCallback, cancellationToken)
+                } else {
+                    textureSynthesizer.synthesizeTexture(optimizedBitmap, targetArea, maskBitmap)
+                }
+            } ?: return@withContext Result.failure(
+                SmartProcessingError.AlgorithmFailure("HealingTool", Exception("Healing operation timed out. Try a smaller area."))
+            )
             
             progressCallback?.invoke(0.9f)
             
@@ -366,7 +372,7 @@ class HealingTool(
      * Calculates bounding rectangle for brush strokes
      */
     private fun calculateBoundingRect(brushStrokes: List<BrushStroke>): Rect {
-        if (brushStrokes.isEmpty()) return Rect()
+        if (brushStrokes.isEmpty()) return Rect(0, 0, 1, 1)
         
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
@@ -382,12 +388,13 @@ class HealingTool(
             }
         }
         
-        return Rect(
-            minX.toInt(),
-            minY.toInt(),
-            maxX.toInt(),
-            maxY.toInt()
-        )
+        // Ensure minimum dimensions of at least 1 pixel
+        val left = minX.toInt()
+        val top = minY.toInt()
+        val right = max(maxX.toInt(), left + 1)
+        val bottom = max(maxY.toInt(), top + 1)
+        
+        return Rect(left, top, right, bottom)
     }
 
     /**

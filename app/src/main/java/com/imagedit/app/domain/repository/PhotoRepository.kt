@@ -12,4 +12,10 @@ interface PhotoRepository {
     suspend fun deletePhoto(id: String): Result<Unit>
     suspend fun toggleFavorite(id: String): Result<Unit>
     suspend fun updatePhoto(photo: Photo): Result<Unit>
+    
+    // Pagination methods
+    fun getLoadingState(): Flow<Boolean>
+    fun hasMorePages(): Flow<Boolean>
+    suspend fun loadNextPage()
+    fun refreshPhotos()
 }

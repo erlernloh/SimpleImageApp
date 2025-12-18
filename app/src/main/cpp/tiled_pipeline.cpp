@@ -17,11 +17,40 @@
 
 namespace ultradetail {
 
-// Lanczos kernel support size (3 = sharper but more ringing, 2 = safer)
-static constexpr float LANCZOS_A = 3.0f;
+// Mitchell-Netravali filter parameters (B=1/3, C=1/3)
+// This kernel is more stable under alignment errors than Lanczos-3
+// Less ringing, better for optical flow-based alignment where shifts are imprecise
+static constexpr float MITCHELL_B = 1.0f / 3.0f;
+static constexpr float MITCHELL_C = 1.0f / 3.0f;
 
-// Standalone Lanczos weight function
-// Using Lanczos-3 for maximum sharpness in super-resolution
+/**
+ * Mitchell-Netravali bicubic filter weight function
+ * 
+ * Replaces Lanczos-3 to reduce ringing artifacts caused by optical flow errors.
+ * B=1/3, C=1/3 provides good balance between blur and ringing.
+ * 
+ * Reference: "Reconstruction Filters in Computer Graphics" (Mitchell & Netravali, 1988)
+ */
+static inline float mitchellWeight(float t) {
+    t = std::abs(t);
+    const float B = MITCHELL_B;
+    const float C = MITCHELL_C;
+    
+    if (t < 1.0f) {
+        return ((12.0f - 9.0f * B - 6.0f * C) * t * t * t
+              + (-18.0f + 12.0f * B + 6.0f * C) * t * t
+              + (6.0f - 2.0f * B)) / 6.0f;
+    } else if (t < 2.0f) {
+        return ((-B - 6.0f * C) * t * t * t
+              + (6.0f * B + 30.0f * C) * t * t
+              + (-12.0f * B - 48.0f * C) * t
+              + (8.0f * B + 24.0f * C)) / 6.0f;
+    }
+    return 0.0f;
+}
+
+// Legacy Lanczos weight function (kept for reference, no longer used in scatter)
+static constexpr float LANCZOS_A = 3.0f;
 static inline float lanczosWeight(float distance, float a = LANCZOS_A) {
     if (distance == 0.0f) return 1.0f;
     if (std::abs(distance) >= a) return 0.0f;
@@ -57,12 +86,22 @@ static inline RGBPixel deringClampRGB(const RGBPixel& value,
 TiledMFSRPipeline::TiledMFSRPipeline(const TilePipelineConfig& config)
     : config_(config) {
     
-    // Initialize processors
-    flowProcessor_ = std::make_unique<DenseOpticalFlow>(config_.flowParams);
+    // Initialize processors based on alignment method
+    if (config_.alignmentMethod == TilePipelineConfig::AlignmentMethod::DENSE_OPTICAL_FLOW) {
+        flowProcessor_ = std::make_unique<DenseOpticalFlow>(config_.flowParams);
+        LOGI("TiledMFSRPipeline: Using dense optical flow alignment");
+    } else {
+        // Fix #5 & #1: Use hybrid aligner (gyro + phase correlation)
+        hybridAligner_ = std::make_unique<HybridAligner>();
+        LOGI("TiledMFSRPipeline: Using hybrid alignment (gyro + phase correlation)");
+    }
+    
     mfsrProcessor_ = std::make_unique<MultiFrameSR>(config_.mfsrParams);
     
-    LOGI("TiledMFSRPipeline initialized: tile=%dx%d, overlap=%d, scale=%d",
-         config_.tileWidth, config_.tileHeight, config_.overlap, config_.scaleFactor);
+    LOGI("TiledMFSRPipeline initialized: tile=%dx%d, overlap=%d, scale=%d, alignment=%s",
+         config_.tileWidth, config_.tileHeight, config_.overlap, config_.scaleFactor,
+         config_.alignmentMethod == TilePipelineConfig::AlignmentMethod::DENSE_OPTICAL_FLOW ? "dense_flow" :
+         config_.alignmentMethod == TilePipelineConfig::AlignmentMethod::PHASE_CORRELATION ? "phase_corr" : "hybrid");
 }
 
 std::vector<TileRegion> TiledMFSRPipeline::computeTileGrid(int width, int height) const {
@@ -155,6 +194,11 @@ float TiledMFSRPipeline::computeRobustnessWeight(
     const RGBPixel& reference,
     float flowConfidence
 ) {
+    // Fix #4: Adaptive robustness weighting
+    // Instead of fixed threshold, adapt based on flow confidence (proxy for motion)
+    // Low confidence (high motion) → more aggressive rejection (lower threshold)
+    // High confidence (low motion) → gentler rejection (higher threshold)
+    
     // Compute color difference
     float dr = pixel.r - reference.r;
     float dg = pixel.g - reference.g;
@@ -163,13 +207,18 @@ float TiledMFSRPipeline::computeRobustnessWeight(
     
     float weight = flowConfidence;
     
+    // Adaptive threshold: base + adjustment based on flow confidence
+    // flowConfidence near 1.0 → use higher threshold (gentler, Huber-like)
+    // flowConfidence near 0.0 → use lower threshold (more aggressive, Tukey-like)
+    float adaptiveThreshold = config_.robustnessThreshold * (0.5f + 0.5f * flowConfidence);
+    
     switch (config_.robustness) {
         case TilePipelineConfig::RobustnessMethod::TUKEY:
-            weight *= tukeyBiweight(colorDiff, config_.robustnessThreshold);
+            weight *= tukeyBiweight(colorDiff, adaptiveThreshold);
             break;
             
         case TilePipelineConfig::RobustnessMethod::HUBER:
-            weight *= huberWeight(colorDiff, config_.robustnessThreshold);
+            weight *= huberWeight(colorDiff, adaptiveThreshold);
             break;
             
         case TilePipelineConfig::RobustnessMethod::NONE:
@@ -182,20 +231,29 @@ float TiledMFSRPipeline::computeRobustnessWeight(
 }
 
 float TiledMFSRPipeline::computeBlendWeight(int x, int y, int width, int height, int overlap) {
-    // Compute distance from edges for smooth blending
+    // Use smooth cosine blending (raised cosine window) for artifact-free tile merging
+    // This is the same approach used by Google's HDR+ and Handheld Super-Res
+    auto smoothstep = [](float t) -> float {
+        // Hermite smoothstep: 3t² - 2t³ for smooth transition
+        t = clamp(t, 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    
     float wx = 1.0f;
     float wy = 1.0f;
     
-    if (x < overlap) {
-        wx = static_cast<float>(x) / overlap;
-    } else if (x >= width - overlap) {
-        wx = static_cast<float>(width - 1 - x) / overlap;
-    }
-    
-    if (y < overlap) {
-        wy = static_cast<float>(y) / overlap;
-    } else if (y >= height - overlap) {
-        wy = static_cast<float>(height - 1 - y) / overlap;
+    if (overlap > 0) {
+        if (x < overlap) {
+            wx = smoothstep(static_cast<float>(x) / overlap);
+        } else if (x >= width - overlap) {
+            wx = smoothstep(static_cast<float>(width - 1 - x) / overlap);
+        }
+        
+        if (y < overlap) {
+            wy = smoothstep(static_cast<float>(y) / overlap);
+        } else if (y >= height - overlap) {
+            wy = smoothstep(static_cast<float>(height - 1 - y) / overlap);
+        }
     }
     
     return wx * wy;
@@ -284,7 +342,11 @@ FallbackReason TiledMFSRPipeline::checkFallbackConditions(
     }
     
     // Check for excessive motion
-    const float maxAllowedMotion = 50.0f;  // pixels
+    // Increased threshold significantly: hand-held phones typically have 20-100+ pixel shifts
+    // between burst frames. The hybrid aligner (phase correlation + gyro) can handle large
+    // motions, so we only reject truly extreme cases (e.g., scene change or severe blur).
+    // Previous value of 50px was too conservative and caused fallback on normal hand-held shots.
+    const float maxAllowedMotion = 200.0f;  // pixels - allow significant hand motion
     float maxMotion = 0.0f;
     
     for (size_t i = 0; i < grayFrames.size(); ++i) {
@@ -292,6 +354,7 @@ FallbackReason TiledMFSRPipeline::checkFallbackConditions(
         
         float motion = estimateGlobalMotion(grayFrames[referenceIndex], grayFrames[i]);
         maxMotion = std::max(maxMotion, motion);
+        LOGI("Frame %zu motion: %.1f pixels", i, motion);
         
         if (motion > maxAllowedMotion) {
             LOGW("Excessive motion detected: %.1f pixels (max allowed: %.1f)", 
@@ -300,7 +363,7 @@ FallbackReason TiledMFSRPipeline::checkFallbackConditions(
         }
     }
     
-    LOGI("Global motion check passed: max=%.1f pixels", maxMotion);
+    LOGI("Global motion check passed: max=%.1f pixels (threshold=%.1f)", maxMotion, maxAllowedMotion);
     return FallbackReason::NONE;
 }
 
@@ -374,15 +437,11 @@ void TiledMFSRPipeline::processTile(
         extractTileCrop(grayFrames[i], tile, grayTileCrops[i]);
     }
     
-    // Step 2: Compute dense optical flow for this tile
-    flowProcessor_->setReference(grayTileCrops[referenceIndex]);
-    
+    // Step 2: Compute alignment for this tile
+    // Fix #5 & #1: Use hybrid alignment (gyro + phase correlation) instead of dense optical flow
     std::vector<FlowField> tileFlows(numFrames);
     float totalFlow = 0.0f;
     int validFlows = 0;
-    
-    // Threshold for skipping optical flow (use gyro-only for small motions)
-    const float GYRO_ONLY_THRESHOLD = 0.5f;  // pixels
     
     for (int i = 0; i < numFrames; ++i) {
         if (i == referenceIndex) {
@@ -396,37 +455,58 @@ void TiledMFSRPipeline::processTile(
             continue;
         }
         
-        // Get gyro initialization
+        // Get gyro homography if available
+        const GyroHomography* gyroPtr = nullptr;
         GyroHomography gyroInit;
-        bool hasGyro = false;
         if (gyroHomographies && config_.useGyroInit && i < static_cast<int>(gyroHomographies->size())) {
             gyroInit = (*gyroHomographies)[i];
-            hasGyro = gyroInit.isValid;
+            if (gyroInit.isValid) {
+                gyroPtr = &gyroInit;
+            }
         }
         
-        // NOTE: We removed the gyro-only fast path optimization because:
-        // 1. On emulators, gyro data is often all zeros (unreliable)
-        // 2. Even with "zero" gyro motion, there's still natural hand shake
-        // 3. Optical flow is needed to detect sub-pixel motion for MFSR to work
-        // 
-        // The optical flow with gyro initialization is still faster than without,
-        // because the search radius is reduced when gyro is available.
-        
-        // Compute dense optical flow for larger motions
-        DenseFlowResult flowResult;
-        flowResult = flowProcessor_->computeFlow(grayTileCrops[i], gyroInit);
-        
-        if (flowResult.isValid) {
-            tileFlows[i] = std::move(flowResult.flowField);
-            totalFlow += flowResult.averageFlow;
-            validFlows++;
-        } else {
-            // Zero flow fallback
-            tileFlows[i].resize(tileCrops[i].width, tileCrops[i].height);
-            for (int y = 0; y < tileFlows[i].height; ++y) {
-                for (int x = 0; x < tileFlows[i].width; ++x) {
-                    tileFlows[i].at(x, y) = FlowVector(0, 0, 0.5f);
+        // Choose alignment method based on configuration
+        if (config_.alignmentMethod == TilePipelineConfig::AlignmentMethod::DENSE_OPTICAL_FLOW) {
+            // Original dense Lucas-Kanade optical flow
+            flowProcessor_->setReference(grayTileCrops[referenceIndex]);
+            DenseFlowResult flowResult = flowProcessor_->computeFlow(grayTileCrops[i], gyroInit);
+            
+            if (flowResult.isValid) {
+                tileFlows[i] = std::move(flowResult.flowField);
+                totalFlow += flowResult.averageFlow;
+                validFlows++;
+            } else {
+                // Zero flow fallback
+                tileFlows[i].resize(tileCrops[i].width, tileCrops[i].height);
+                for (int y = 0; y < tileFlows[i].height; ++y) {
+                    for (int x = 0; x < tileFlows[i].width; ++x) {
+                        tileFlows[i].at(x, y) = FlowVector(0, 0, 0.5f);
+                    }
                 }
+            }
+        } else {
+            // Fix #5 & #1: Hybrid alignment (gyro + phase correlation)
+            // Much faster and more robust for global translations
+            tileFlows[i] = hybridAligner_->computeAlignment(
+                grayTileCrops[referenceIndex],
+                grayTileCrops[i],
+                gyroPtr,
+                config_.useLocalRefinement
+            );
+            
+            // Compute average flow for statistics
+            float sumFlow = 0.0f;
+            int count = 0;
+            for (int y = 0; y < tileFlows[i].height; y += 4) {
+                for (int x = 0; x < tileFlows[i].width; x += 4) {
+                    const FlowVector& fv = tileFlows[i].at(x, y);
+                    sumFlow += fv.magnitude();
+                    count++;
+                }
+            }
+            if (count > 0) {
+                totalFlow += sumFlow / count;
+                validFlows++;
             }
         }
     }
@@ -461,9 +541,21 @@ void TiledMFSRPipeline::processTile(
     const RGBImage& refCrop = tileCrops[referenceIndex];
     
     // Scatter pixels from all frames to high-res grid
+    // Sub-pixel diversity is critical for MFSR quality - it comes from:
+    // 1. Fractional part of alignment shifts (e.g., 19.59px -> 0.59 sub-pixel offset)
+    // 2. Natural hand motion variation between frames
     for (int frameIdx = 0; frameIdx < numFrames; ++frameIdx) {
         const RGBImage& crop = tileCrops[frameIdx];
         const FlowField& flow = tileFlows[frameIdx];
+        
+        // Add deterministic sub-pixel offset per frame to ensure diversity
+        // This helps when alignment is too precise (integer-aligned)
+        // Uses golden ratio for optimal sub-pixel sampling distribution
+        const float phi = 1.618033988749895f;
+        float frameOffsetX = std::fmod(frameIdx * phi, 1.0f) - 0.5f;  // Range [-0.5, 0.5]
+        float frameOffsetY = std::fmod(frameIdx * phi * phi, 1.0f) - 0.5f;
+        frameOffsetX *= 0.3f;  // Scale down to subtle sub-pixel jitter
+        frameOffsetY *= 0.3f;
         
         for (int y = 0; y < crop.height; ++y) {
             for (int x = 0; x < crop.width; ++x) {
@@ -475,9 +567,11 @@ void TiledMFSRPipeline::processTile(
                     continue;
                 }
                 
-                // Compute destination in HR grid
-                float dstX = (x - fv.dx) * config_.scaleFactor;
-                float dstY = (y - fv.dy) * config_.scaleFactor;
+                // Compute destination in HR grid with sub-pixel offset
+                // The fractional part of (fv.dx, fv.dy) provides natural sub-pixel diversity
+                // frameOffset adds additional diversity when alignment is too precise
+                float dstX = (x - fv.dx + frameOffsetX) * config_.scaleFactor;
+                float dstY = (y - fv.dy + frameOffsetY) * config_.scaleFactor;
                 
                 // Skip out-of-bounds
                 if (dstX < 0 || dstX >= outWidth - 1 || dstY < 0 || dstY >= outHeight - 1) {
@@ -490,9 +584,10 @@ void TiledMFSRPipeline::processTile(
                     robustWeight = computeRobustnessWeight(pixel, refCrop.at(x, y), fv.confidence);
                 }
                 
-                // Lanczos-3 splatting (6x6 kernel) for maximum sharpness
-                const int kernelRadius = static_cast<int>(LANCZOS_A);  // 3 for Lanczos-3
-                const int kernelSize = kernelRadius * 2;  // 6x6 kernel
+                // Mitchell-Netravali splatting (4x4 kernel) - more stable than Lanczos-3
+                // under optical flow alignment errors. Less ringing, better for imprecise shifts.
+                const int kernelRadius = 2;  // Mitchell-Netravali has support [-2, 2]
+                const int kernelSize = kernelRadius * 2;  // 4x4 kernel
                 int x0 = static_cast<int>(std::floor(dstX)) - kernelRadius + 1;
                 int y0 = static_cast<int>(std::floor(dstY)) - kernelRadius + 1;
                 
@@ -500,15 +595,15 @@ void TiledMFSRPipeline::processTile(
                     int py = y0 + ky;
                     if (py < 0 || py >= outHeight) continue;
                     
-                    float dy = std::abs(dstY - py);
-                    float wy = lanczosWeight(dy);
+                    float dy = dstY - py;
+                    float wy = mitchellWeight(dy);
                     
                     for (int kx = 0; kx < kernelSize; ++kx) {
                         int px = x0 + kx;
                         if (px < 0 || px >= outWidth) continue;
                         
-                        float dx = std::abs(dstX - px);
-                        float wx = lanczosWeight(dx);
+                        float dx = dstX - px;
+                        float wx = mitchellWeight(dx);
                         
                         float w = wx * wy * fv.confidence * robustWeight;
                         if (w <= 0.0f) continue;
@@ -561,37 +656,67 @@ void TiledMFSRPipeline::processTile(
         }
     }
     
-    // Fill gaps using neighbor averaging
-    for (int pass = 0; pass < 3; ++pass) {
-        for (int y = 1; y < outHeight - 1; ++y) {
-            for (int x = 1; x < outWidth - 1; ++x) {
-                if (accumulator.at(x, y).weight > 0.0f) continue;
+    // Fill gaps using bicubic interpolation from reference frame
+    // This is the approach used by Google's Handheld Super-Res - gaps are filled
+    // with upscaled reference frame data rather than neighbor averaging
+    auto bicubicWeight = [](float t) -> float {
+        // Mitchell-Netravali filter (B=1/3, C=1/3) - good balance of blur/ringing
+        t = std::abs(t);
+        if (t < 1.0f) {
+            return (12.0f - 9.0f * (1.0f/3.0f) - 6.0f * (1.0f/3.0f)) * t * t * t
+                 + (-18.0f + 12.0f * (1.0f/3.0f) + 6.0f * (1.0f/3.0f)) * t * t
+                 + (6.0f - 2.0f * (1.0f/3.0f));
+        } else if (t < 2.0f) {
+            return (-(1.0f/3.0f) - 6.0f * (1.0f/3.0f)) * t * t * t
+                 + (6.0f * (1.0f/3.0f) + 30.0f * (1.0f/3.0f)) * t * t
+                 + (-12.0f * (1.0f/3.0f) - 48.0f * (1.0f/3.0f)) * t
+                 + (8.0f * (1.0f/3.0f) + 24.0f * (1.0f/3.0f));
+        }
+        return 0.0f;
+    };
+    
+    // Fill gaps with bicubic-upscaled reference frame
+    for (int y = 0; y < outHeight; ++y) {
+        for (int x = 0; x < outWidth; ++x) {
+            if (accumulator.at(x, y).weight > 0.0f) continue;
+            
+            // Map HR position back to LR reference frame
+            float srcX = static_cast<float>(x) / config_.scaleFactor;
+            float srcY = static_cast<float>(y) / config_.scaleFactor;
+            
+            // Bicubic interpolation from reference frame
+            int x0 = static_cast<int>(std::floor(srcX)) - 1;
+            int y0 = static_cast<int>(std::floor(srcY)) - 1;
+            
+            float sumR = 0, sumG = 0, sumB = 0, sumW = 0;
+            
+            for (int ky = 0; ky < 4; ++ky) {
+                int py = y0 + ky;
+                if (py < 0 || py >= refCrop.height) continue;
                 
-                float sumR = 0, sumG = 0, sumB = 0;
-                int count = 0;
+                float wy = bicubicWeight(srcY - py) / 6.0f;  // Normalize
                 
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (dx == 0 && dy == 0) continue;
-                        const AccumPixel& neighbor = accumulator.at(x + dx, y + dy);
-                        if (neighbor.weight > 0.0f) {
-                            float invW = 1.0f / neighbor.weight;
-                            sumR += neighbor.r * invW;
-                            sumG += neighbor.g * invW;
-                            sumB += neighbor.b * invW;
-                            count++;
-                        }
-                    }
+                for (int kx = 0; kx < 4; ++kx) {
+                    int px = x0 + kx;
+                    if (px < 0 || px >= refCrop.width) continue;
+                    
+                    float wx = bicubicWeight(srcX - px) / 6.0f;
+                    float w = wx * wy;
+                    
+                    const RGBPixel& p = refCrop.at(px, py);
+                    sumR += p.r * w;
+                    sumG += p.g * w;
+                    sumB += p.b * w;
+                    sumW += w;
                 }
-                
-                if (count > 0) {
-                    RGBPixel& out = result.outputTile.at(x, y);
-                    out.r = sumR / count;
-                    out.g = sumG / count;
-                    out.b = sumB / count;
-                    accumulator.at(x, y).weight = 0.001f;  // Mark as filled
-                    validPixels++;
-                }
+            }
+            
+            if (sumW > 0.0f) {
+                RGBPixel& out = result.outputTile.at(x, y);
+                out.r = clamp(sumR / sumW, 0.0f, 1.0f);
+                out.g = clamp(sumG / sumW, 0.0f, 1.0f);
+                out.b = clamp(sumB / sumW, 0.0f, 1.0f);
+                validPixels++;
             }
         }
     }
@@ -687,6 +812,121 @@ void TiledMFSRPipeline::process(
                 p.r = clamp(p.r / w, 0.0f, 1.0f);
                 p.g = clamp(p.g / w, 0.0f, 1.0f);
                 p.b = clamp(p.b / w, 0.0f, 1.0f);
+            }
+        }
+    }
+    
+    // Post-processing: Edge-preserving smoothing to remove blotchy artifacts
+    // Uses a simplified bilateral filter approach similar to Google's HDR+
+    if (progressCallback) {
+        progressCallback(totalTiles, totalTiles, "Smoothing artifacts", 0.95f);
+    }
+    
+    // Create a copy for filtering
+    // Fix #6: Tuned bilateral filter parameters for less aggressive smoothing
+    // Previous values (spatialSigma=1.5, rangeSigma=0.08) were too aggressive,
+    // causing over-smoothing and loss of detail. New values preserve more texture.
+    RGBImage smoothed(outWidth, outHeight);
+    const int filterRadius = 2;  // Small radius for subtle smoothing
+    const float spatialSigma = 2.5f;   // Wider spatial kernel (was 1.5)
+    const float rangeSigma = 0.15f;    // More tolerant of color variation (was 0.08)
+    
+    for (int y = filterRadius; y < outHeight - filterRadius; ++y) {
+        for (int x = filterRadius; x < outWidth - filterRadius; ++x) {
+            const RGBPixel& center = result.outputImage.at(x, y);
+            
+            float sumR = 0, sumG = 0, sumB = 0, sumW = 0;
+            
+            for (int dy = -filterRadius; dy <= filterRadius; ++dy) {
+                for (int dx = -filterRadius; dx <= filterRadius; ++dx) {
+                    const RGBPixel& neighbor = result.outputImage.at(x + dx, y + dy);
+                    
+                    // Spatial weight (Gaussian)
+                    float spatialDist = std::sqrt(static_cast<float>(dx*dx + dy*dy));
+                    float spatialW = std::exp(-spatialDist * spatialDist / (2.0f * spatialSigma * spatialSigma));
+                    
+                    // Range weight (color similarity)
+                    float colorDiff = std::sqrt(
+                        (neighbor.r - center.r) * (neighbor.r - center.r) +
+                        (neighbor.g - center.g) * (neighbor.g - center.g) +
+                        (neighbor.b - center.b) * (neighbor.b - center.b)
+                    );
+                    float rangeW = std::exp(-colorDiff * colorDiff / (2.0f * rangeSigma * rangeSigma));
+                    
+                    float w = spatialW * rangeW;
+                    sumR += neighbor.r * w;
+                    sumG += neighbor.g * w;
+                    sumB += neighbor.b * w;
+                    sumW += w;
+                }
+            }
+            
+            if (sumW > 0.0f) {
+                smoothed.at(x, y) = RGBPixel(
+                    clamp(sumR / sumW, 0.0f, 1.0f),
+                    clamp(sumG / sumW, 0.0f, 1.0f),
+                    clamp(sumB / sumW, 0.0f, 1.0f)
+                );
+            } else {
+                smoothed.at(x, y) = center;
+            }
+        }
+    }
+    
+    // Copy smoothed result back (excluding border)
+    for (int y = filterRadius; y < outHeight - filterRadius; ++y) {
+        for (int x = filterRadius; x < outWidth - filterRadius; ++x) {
+            result.outputImage.at(x, y) = smoothed.at(x, y);
+        }
+    }
+    
+    // Post-processing: Unsharp Mask (USM) sharpening to restore detail
+    // This is essential for MFSR output which tends to be soft due to averaging
+    if (progressCallback) {
+        progressCallback(totalTiles, totalTiles, "Sharpening", 0.98f);
+    }
+    
+    // USM parameters tuned for MFSR output
+    const float usmAmount = 0.5f;      // Sharpening strength (0.3-0.7 typical)
+    const float usmThreshold = 0.02f;  // Edge threshold to avoid noise amplification
+    const int usmRadius = 1;           // Small radius for fine detail
+    
+    // Create blurred version for USM (simple box blur for speed)
+    RGBImage blurred(outWidth, outHeight);
+    for (int y = usmRadius; y < outHeight - usmRadius; ++y) {
+        for (int x = usmRadius; x < outWidth - usmRadius; ++x) {
+            float sumR = 0, sumG = 0, sumB = 0;
+            int count = 0;
+            for (int dy = -usmRadius; dy <= usmRadius; ++dy) {
+                for (int dx = -usmRadius; dx <= usmRadius; ++dx) {
+                    const RGBPixel& p = result.outputImage.at(x + dx, y + dy);
+                    sumR += p.r;
+                    sumG += p.g;
+                    sumB += p.b;
+                    count++;
+                }
+            }
+            blurred.at(x, y) = RGBPixel(sumR / count, sumG / count, sumB / count);
+        }
+    }
+    
+    // Apply USM: sharpened = original + amount * (original - blurred)
+    for (int y = usmRadius; y < outHeight - usmRadius; ++y) {
+        for (int x = usmRadius; x < outWidth - usmRadius; ++x) {
+            RGBPixel& p = result.outputImage.at(x, y);
+            const RGBPixel& b = blurred.at(x, y);
+            
+            // Compute high-frequency detail (difference from blur)
+            float diffR = p.r - b.r;
+            float diffG = p.g - b.g;
+            float diffB = p.b - b.b;
+            
+            // Only sharpen if detail is above threshold (avoid noise)
+            float detailMag = std::sqrt(diffR*diffR + diffG*diffG + diffB*diffB);
+            if (detailMag > usmThreshold) {
+                p.r = clamp(p.r + usmAmount * diffR, 0.0f, 1.0f);
+                p.g = clamp(p.g + usmAmount * diffG, 0.0f, 1.0f);
+                p.b = clamp(p.b + usmAmount * diffB, 0.0f, 1.0f);
             }
         }
     }

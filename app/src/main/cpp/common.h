@@ -56,10 +56,11 @@ constexpr int MAX_PYRAMID_LEVELS = 4;
 constexpr int MIN_BURST_FRAMES = 8;
 constexpr int MAX_BURST_FRAMES = 12;
 
-// Edge detection thresholds
-constexpr float EDGE_THRESHOLD_LOW = 15.0f;
-constexpr float EDGE_THRESHOLD_HIGH = 50.0f;
-constexpr float DETAIL_TILE_THRESHOLD = 25.0f;
+// Edge detection thresholds (normalized [0,1] range)
+// Note: RGB values are in [0,1] range, so gradients are small
+constexpr float EDGE_THRESHOLD_LOW = 0.02f;    // ~5/255
+constexpr float EDGE_THRESHOLD_HIGH = 0.10f;   // ~25/255
+constexpr float DETAIL_TILE_THRESHOLD = 0.01f; // Low threshold to catch subtle detail
 
 // Merge parameters
 constexpr float TRIMMED_MEAN_RATIO = 0.2f;   // Trim 20% from each end

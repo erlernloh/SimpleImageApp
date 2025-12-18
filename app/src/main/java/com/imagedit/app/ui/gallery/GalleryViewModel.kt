@@ -10,7 +10,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.imagedit.app.domain.model.Photo
 import com.imagedit.app.domain.repository.PhotoRepository
-import com.imagedit.app.data.repository.PhotoRepositoryImpl
 import com.imagedit.app.ui.common.ExportFormat
 import com.imagedit.app.ui.common.ExportQuality
 import com.imagedit.app.ui.common.ExportOptions
@@ -90,7 +89,7 @@ class GalleryViewModel @Inject constructor(
         }
         // Always refresh from MediaStore to pick up newly saved photos
         viewModelScope.launch {
-            (photoRepository as PhotoRepositoryImpl).refreshPhotos()
+            photoRepository.refreshPhotos()
         }
     }
     
@@ -101,8 +100,8 @@ class GalleryViewModel @Inject constructor(
                 combine(
                     photoRepository.getAllPhotos(),
                     photoRepository.getFavoritePhotos(),
-                    (photoRepository as PhotoRepositoryImpl).getLoadingState(),
-                    (photoRepository as PhotoRepositoryImpl).hasMorePages()
+                    photoRepository.getLoadingState(),
+                    photoRepository.hasMorePages()
                 ) { photos, favorites, isLoading, hasMorePages ->
                     _uiState.value.copy(
                         photos = photos,
@@ -131,7 +130,7 @@ class GalleryViewModel @Inject constructor(
     
     fun loadNextPage() {
         viewModelScope.launch {
-            (photoRepository as PhotoRepositoryImpl).loadNextPage()
+            photoRepository.loadNextPage()
         }
     }
     
@@ -197,7 +196,7 @@ class GalleryViewModel @Inject constructor(
     fun refreshPhotos() {
         viewModelScope.launch {
             // Actually refresh from MediaStore, not just re-collect the flow
-            (photoRepository as PhotoRepositoryImpl).refreshPhotos()
+            photoRepository.refreshPhotos()
         }
     }
     

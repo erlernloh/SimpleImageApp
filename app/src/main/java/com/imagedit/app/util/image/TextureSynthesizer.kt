@@ -14,9 +14,10 @@ class TextureSynthesizer {
     companion object {
         private const val PATCH_SIZE = 32
         private const val OVERLAP_SIZE = 8
-        private const val MAX_PATCHES_TO_EVALUATE = 100
-        private const val SIMILARITY_THRESHOLD = 0.6f
-        private const val MULTI_SCALE_LEVELS = 3
+        private const val MAX_PATCHES_TO_EVALUATE = 20 // Reduced from 100 for performance
+        private const val MAX_TARGET_PATCHES = 50 // Limit total patches to process
+        private const val SIMILARITY_THRESHOLD = 0.5f // Lowered for faster matching
+        private const val MULTI_SCALE_LEVELS = 2 // Reduced from 3 for performance
         private const val GRADIENT_WEIGHT = 0.3f
         private const val TEXTURE_WEIGHT = 0.4f
         private const val COLOR_WEIGHT = 0.3f
@@ -120,13 +121,13 @@ class TextureSynthesizer {
      */
     private fun generatePatchRects(targetArea: Rect, patchSize: Int = PATCH_SIZE): List<Rect> {
         val patches = mutableListOf<Rect>()
-        val overlapSize = (patchSize * 0.25f).toInt().coerceAtLeast(4)
-        val stepSize = patchSize - overlapSize
+        // Use 50% overlap instead of 75% for better performance
+        val stepSize = (patchSize * 0.5f).toInt().coerceAtLeast(8)
         
         var y = targetArea.top
-        while (y < targetArea.bottom) {
+        while (y < targetArea.bottom && patches.size < MAX_TARGET_PATCHES) {
             var x = targetArea.left
-            while (x < targetArea.right) {
+            while (x < targetArea.right && patches.size < MAX_TARGET_PATCHES) {
                 val patchRect = Rect(
                     x,
                     y,
@@ -200,12 +201,34 @@ class TextureSynthesizer {
             (targetRect.bottom + borderWidth).coerceAtMost(sourceBitmap.height)
         )
         
+        // Ensure minimum dimensions
+        val width = expandedRect.width().coerceAtLeast(1)
+        val height = expandedRect.height().coerceAtLeast(1)
+        val safeWidth = minOf(width, sourceBitmap.width - expandedRect.left)
+        val safeHeight = minOf(height, sourceBitmap.height - expandedRect.top)
+        
+        if (safeWidth <= 0 || safeHeight <= 0) {
+            // Return default features if rect is invalid
+            return TextureFeatures(
+                averageColor = 0,
+                colorVariance = 0f,
+                edgeDensity = 0f,
+                dominantDirection = 0f,
+                contrast = 0f,
+                entropy = 0f,
+                localBinaryPattern = FloatArray(256),
+                gradientMagnitude = 0f,
+                textureEnergy = 0f,
+                homogeneity = 0f
+            )
+        }
+        
         val borderBitmap = Bitmap.createBitmap(
             sourceBitmap,
             expandedRect.left,
             expandedRect.top,
-            expandedRect.width(),
-            expandedRect.height()
+            safeWidth,
+            safeHeight
         )
         
         return analyzeAdvancedTextureFeatures(borderBitmap)
@@ -260,13 +283,27 @@ class TextureSynthesizer {
         maskBitmap: Bitmap,
         targetFeatures: TextureFeatures
     ): Float {
+        // Validate source rect dimensions
+        val width = sourceRect.width().coerceAtLeast(1)
+        val height = sourceRect.height().coerceAtLeast(1)
+        val left = sourceRect.left.coerceIn(0, sourceBitmap.width - width)
+        val top = sourceRect.top.coerceIn(0, sourceBitmap.height - height)
+        
+        // Ensure we don't exceed bitmap bounds
+        val safeWidth = minOf(width, sourceBitmap.width - left)
+        val safeHeight = minOf(height, sourceBitmap.height - top)
+        
+        if (safeWidth <= 0 || safeHeight <= 0) {
+            return 0f // Invalid rect, return no similarity
+        }
+        
         // Get candidate patch features
         val candidateBitmap = Bitmap.createBitmap(
             sourceBitmap,
-            sourceRect.left,
-            sourceRect.top,
-            sourceRect.width(),
-            sourceRect.height()
+            left,
+            top,
+            safeWidth,
+            safeHeight
         )
         val candidateFeatures = analyzeAdvancedTextureFeatures(candidateBitmap)
         

@@ -12,6 +12,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -40,6 +41,7 @@ import com.imagedit.app.domain.model.HealingBrush
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.toSize
 
@@ -91,7 +93,7 @@ fun PhotoEditorScreen(
                     },
                     navigationIcon = {
                         IconButton(onClick = handleBackNavigation) {
-                            Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                         }
                     },
                     actions = {
@@ -267,11 +269,69 @@ fun PhotoEditorScreen(
                         
                         // Healing brush overlay
                         if (uiState.isHealingToolActive && imageSize != Size.Zero) {
+                            // Calculate content rect for coordinate mapping (same as crop)
+                            val containerW = imageSize.width
+                            val containerH = imageSize.height
+                            val bmpW = bitmap?.width?.toFloat() ?: 1f
+                            val bmpH = bitmap?.height?.toFloat() ?: 1f
+                            val imageAspect = if (bmpH != 0f) bmpW / bmpH else 1f
+                            val containerAspect = if (containerH != 0f) containerW / containerH else imageAspect
+
+                            val healingContentRect: Rect = if (containerW > 0f && containerH > 0f) {
+                                if (imageAspect > containerAspect) {
+                                    val fitWidth = containerW
+                                    val fitHeight = fitWidth / imageAspect
+                                    val offsetX = 0f
+                                    val offsetY = (containerH - fitHeight) / 2f
+                                    Rect(offset = Offset(offsetX, offsetY), size = Size(fitWidth, fitHeight))
+                                } else {
+                                    val fitHeight = containerH
+                                    val fitWidth = fitHeight * imageAspect
+                                    val offsetY = 0f
+                                    val offsetX = (containerW - fitWidth) / 2f
+                                    Rect(offset = Offset(offsetX, offsetY), size = Size(fitWidth, fitHeight))
+                                }
+                            } else {
+                                Rect(Offset.Zero, imageSize)
+                            }
+
+                            // Update healing bounds in ViewModel for coordinate mapping
+                            LaunchedEffect(healingContentRect, bmpW, bmpH) {
+                                viewModel.setHealingImageBounds(healingContentRect, bmpW.toInt(), bmpH.toInt())
+                            }
+
+                            // Convert completed strokes to visual path
+                            val completedStrokesPath = remember(uiState.healingStrokes) {
+                                val path = Path()
+                                viewModel.getCompletedHealingStrokesScreenPoints().forEach { strokePoints ->
+                                    if (strokePoints.isNotEmpty()) {
+                                        path.moveTo(strokePoints.first().x, strokePoints.first().y)
+                                        strokePoints.drop(1).forEach { point ->
+                                            path.lineTo(point.x, point.y)
+                                        }
+                                    }
+                                }
+                                if (path.isEmpty) null else path
+                            }
+                            
+                            // Convert current stroke to visual path (updates during drag)
+                            val currentStrokePoints = viewModel.getCurrentHealingStrokeScreenPoints()
+                            val currentStrokePath = remember(currentStrokePoints) {
+                                if (currentStrokePoints.isEmpty()) null
+                                else {
+                                    Path().apply {
+                                        moveTo(currentStrokePoints.first().x, currentStrokePoints.first().y)
+                                        currentStrokePoints.drop(1).forEach { point ->
+                                            lineTo(point.x, point.y)
+                                        }
+                                    }
+                                }
+                            }
+                            
                             HealingBrushOverlay(
                                 brushSettings = uiState.healingBrushSettings,
                                 onBrushStart = { x, y, pressure ->
-                                    // Convert screen coordinates to image coordinates
-                                    // This is a simplified implementation
+                                    // Pass screen coordinates - ViewModel will convert to bitmap coordinates
                                     viewModel.startHealingStroke(x, y, pressure)
                                 },
                                 onBrushMove = { x, y, pressure ->
@@ -280,8 +340,8 @@ fun PhotoEditorScreen(
                                 onBrushEnd = {
                                     viewModel.finishHealingStroke()
                                 },
-                                strokePath = null, // TODO: Convert strokes to path
-                                currentStrokePath = null, // TODO: Convert current stroke to path
+                                strokePath = completedStrokesPath,
+                                currentStrokePath = currentStrokePath,
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
@@ -618,6 +678,30 @@ fun PhotoEditorScreen(
                                 }
                             }
                             
+                            // Progress indicator when processing
+                            if (uiState.isHealingProcessing && uiState.healingProgress >= 0f) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Text(
+                                        text = "Healing in progress... ${(uiState.healingProgress * 100).toInt()}%",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    LinearProgressIndicator(
+                                        progress = { uiState.healingProgress.coerceIn(0f, 1f) },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(8.dp),
+                                        color = MaterialTheme.colorScheme.primary,
+                                        trackColor = MaterialTheme.colorScheme.surfaceVariant
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                }
+                            }
+                            
                             // Apply healing button
                             Button(
                                 onClick = { viewModel.applyHealing() },
@@ -631,7 +715,7 @@ fun PhotoEditorScreen(
                                         color = MaterialTheme.colorScheme.onPrimary
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Processing...")
+                                    Text("${(uiState.healingProgress * 100).toInt()}%")
                                 } else {
                                     Icon(
                                         Icons.Default.Check,

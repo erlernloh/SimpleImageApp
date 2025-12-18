@@ -63,7 +63,17 @@ fun AppNavigation(
                 )
             }
         
-        composable("gallery?exportUri={exportUri}") { backStackEntry ->
+        // Gallery route - supports optional exportUri parameter
+        composable(
+            route = "gallery?exportUri={exportUri}",
+            arguments = listOf(
+                androidx.navigation.navArgument("exportUri") {
+                    type = androidx.navigation.NavType.StringType
+                    nullable = true
+                    defaultValue = null
+                }
+            )
+        ) { backStackEntry ->
             val encodedExportUri = backStackEntry.arguments?.getString("exportUri")
             val exportUri = encodedExportUri?.takeIf { it != "null" }?.let {
                 URLDecoder.decode(it, StandardCharsets.UTF_8.toString())
@@ -153,7 +163,7 @@ fun AppNavigation(
                 onNavigateBack = {
                     navController.popBackStack()
                 },
-                onImageCaptured = { bitmap ->
+                onImageSaved = {
                     // Image is saved by the screen, navigate to gallery to see it
                     navController.navigate("gallery") {
                         popUpTo("camera") { inclusive = false }

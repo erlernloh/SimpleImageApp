@@ -43,7 +43,7 @@ sealed class PipelineState {
     data class ApplyingSuperResolution(val tilesProcessed: Int, val totalTiles: Int) : PipelineState()
     data class ProcessingMFSR(val tilesProcessed: Int, val totalTiles: Int, val progress: Float) : PipelineState()
     data class RefiningMFSR(val tilesProcessed: Int, val totalTiles: Int) : PipelineState()
-    data class Complete(val result: Bitmap, val processingTimeMs: Long) : PipelineState()
+    data class Complete(val result: Bitmap, val processingTimeMs: Long, val framesUsed: Int = 0) : PipelineState()
     data class Error(val message: String, val fallbackResult: Bitmap?) : PipelineState()
 }
 
@@ -59,7 +59,8 @@ data class UltraDetailResult(
     val preset: UltraDetailPreset,
     val mfsrApplied: Boolean = false,
     val mfsrScaleFactor: Int = 1,
-    val mfsrCoveragePercent: Float = 0f
+    val mfsrCoveragePercent: Float = 0f,
+    val alignmentQuality: Float = 0f  // RGB quality mask alignment percentage (0-100)
 )
 
 /**
@@ -82,6 +83,11 @@ class UltraDetailPipeline(
     private var mfsrRefiner: MFSRRefiner? = null
     private val gyroHelper = GyroAlignmentHelper()
     
+    // Advanced alignment components
+    // NOTE: alignmentWatermark disabled - pure Kotlin NCC is O(n^4), too slow
+    // private val alignmentWatermark = AlignmentWatermark()
+    private val rgbQualityMask = RGBQualityMask()
+    
     private var currentJob: Job? = null
     
     /**
@@ -91,8 +97,18 @@ class UltraDetailPipeline(
      */
     suspend fun initialize(preset: UltraDetailPreset): Boolean = withContext(Dispatchers.IO) {
         try {
-            // ULTRA preset uses dedicated MFSR pipeline
-            if (preset == UltraDetailPreset.ULTRA) {
+            // Check if native library is available
+            if (!NativeMFSRPipeline.isAvailable() && (preset == UltraDetailPreset.MAX || preset == UltraDetailPreset.ULTRA)) {
+                Log.e(TAG, "Native MFSR library not available: ${NativeMFSRPipeline.getLoadError()}")
+                return@withContext false
+            }
+            if (!NativeBurstProcessor.isAvailable() && (preset == UltraDetailPreset.FAST || preset == UltraDetailPreset.BALANCED)) {
+                Log.e(TAG, "Native burst processor not available: ${NativeBurstProcessor.getLoadError()}")
+                return@withContext false
+            }
+            
+            // MAX and ULTRA presets use dedicated MFSR pipeline for high-quality processing
+            if (preset == UltraDetailPreset.MAX || preset == UltraDetailPreset.ULTRA) {
                 // Initialize tile-based MFSR pipeline
                 // Use larger tiles (512x512) to reduce processing time
                 // This reduces tile count from ~20 to ~6 for a 1280x960 image
@@ -101,29 +117,32 @@ class UltraDetailPipeline(
                     tileHeight = 512,
                     overlap = 64,
                     scaleFactor = 2,
-                    robustness = MFSRRobustness.TUKEY,
+                    robustness = MFSRRobustness.HUBER,  // HUBER is gentler than TUKEY for low-diversity frames
+                    robustnessThreshold = 0.8f,  // Higher threshold allows more frame contribution
                     useGyroInit = true
                 ))
                 
-                // Initialize neural refiner
-                try {
-                    mfsrRefiner = MFSRRefiner(context, RefinerConfig(
-                        tileSize = 128,
-                        overlap = 16,
-                        useGpu = true,
-                        blendStrength = 0.7f
-                    ))
-                    
-                    if (!mfsrRefiner!!.initialize()) {
-                        Log.w(TAG, "MFSR refiner initialization failed, will skip refinement")
+                // Initialize neural refiner only for ULTRA preset
+                if (preset == UltraDetailPreset.ULTRA) {
+                    try {
+                        mfsrRefiner = MFSRRefiner(context, RefinerConfig(
+                            tileSize = 128,
+                            overlap = 16,
+                            useGpu = true,
+                            blendStrength = 0.7f
+                        ))
+                        
+                        if (!mfsrRefiner!!.initialize()) {
+                            Log.w(TAG, "MFSR refiner initialization failed, will skip refinement")
+                            mfsrRefiner = null
+                        }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "MFSR refiner creation failed: ${e.message}")
                         mfsrRefiner = null
                     }
-                } catch (e: Throwable) {
-                    Log.w(TAG, "MFSR refiner creation failed: ${e.message}")
-                    mfsrRefiner = null
                 }
                 
-                Log.i(TAG, "Pipeline initialized with ULTRA preset (MFSR + refinement)")
+                Log.i(TAG, "Pipeline initialized with $preset preset (MFSR${if (preset == UltraDetailPreset.ULTRA) " + refinement" else ""})")
                 return@withContext true
             }
             
@@ -154,26 +173,35 @@ class UltraDetailPipeline(
             nativeProcessor = NativeBurstProcessor.create(nativeParams)
             
             // Initialize SR processor for MAX preset
+            // Only initialize if the downloaded model is available (not the placeholder)
             if (preset == UltraDetailPreset.MAX) {
-                try {
-                    srProcessor = SuperResolutionProcessor(
-                        context,
-                        SRConfig(
-                            scaleFactor = SRScaleFactor.X4,  // ESRGAN is 4x
-                            tileSize = 50,                    // ESRGAN input size
-                            overlap = 8,
-                            acceleration = SRAcceleration.CPU  // Use CPU to avoid GPU delegate issues
+                val modelDownloader = ModelDownloader(context)
+                if (modelDownloader.isModelAvailable(AvailableModels.ESRGAN_FP16)) {
+                    try {
+                        srProcessor = SuperResolutionProcessor(
+                            context,
+                            SRConfig(
+                                scaleFactor = SRScaleFactor.X4,  // ESRGAN is 4x
+                                tileSize = 50,                    // ESRGAN input size
+                                overlap = 8,
+                                acceleration = SRAcceleration.CPU,  // Use CPU to avoid GPU delegate issues
+                                useExternalModel = true  // Load from downloaded file
+                            )
                         )
-                    )
-                    
-                    if (!srProcessor!!.initialize()) {
-                        Log.w(TAG, "SR processor initialization failed, will use bicubic fallback")
+                        
+                        if (!srProcessor!!.initialize()) {
+                            Log.w(TAG, "SR processor initialization failed, will use bicubic fallback")
+                            srProcessor = null
+                        } else {
+                            Log.i(TAG, "SR processor initialized with downloaded model")
+                        }
+                    } catch (e: Throwable) {
+                        // Catch Throwable to handle NoClassDefFoundError and other class loading issues
+                        Log.w(TAG, "SR processor creation failed: ${e.message}, will use bicubic fallback")
                         srProcessor = null
                     }
-                } catch (e: Throwable) {
-                    // Catch Throwable to handle NoClassDefFoundError and other class loading issues
-                    Log.w(TAG, "SR processor creation failed: ${e.message}, will use native MFSR only")
-                    srProcessor = null
+                } else {
+                    Log.i(TAG, "SR model not downloaded, will use bicubic 4x upscale")
                 }
             }
             
@@ -299,7 +327,7 @@ class UltraDetailPipeline(
                 if (rotatedBitmap !== mergedBitmap) {
                     mergedBitmap.recycle()
                 }
-                _state.value = PipelineState.Complete(rotatedBitmap, processingTime)
+                _state.value = PipelineState.Complete(rotatedBitmap, processingTime, frames.size)
                 
                 return@withContext UltraDetailResult(
                     bitmap = rotatedBitmap,
@@ -327,7 +355,7 @@ class UltraDetailPipeline(
                 if (rotatedBitmap !== mergedBitmap) {
                     mergedBitmap.recycle()
                 }
-                _state.value = PipelineState.Complete(rotatedBitmap, processingTime)
+                _state.value = PipelineState.Complete(rotatedBitmap, processingTime, frames.size)
                 
                 return@withContext UltraDetailResult(
                     bitmap = rotatedBitmap,
@@ -345,22 +373,35 @@ class UltraDetailPipeline(
             var srTilesProcessed = 0
             
             val finalBitmap = try {
-                srProcessor?.process(
-                    mergedBitmap,
-                    if (detailTileCount > 0) detailMask else null,
-                    maskTileSize
-                ) { processed, total, _ ->
-                    srTilesProcessed = processed
-                    _state.value = PipelineState.ApplyingSuperResolution(processed, total)
-                } ?: run {
-                    // SR processor not available, use bicubic upscale
-                    Log.w(TAG, "SR processor not available, using bicubic upscale")
+                // Skip SR if no detail tiles detected - use fast bicubic instead
+                if (detailTileCount <= 0) {
+                    Log.i(TAG, "No detail tiles detected, using bicubic 4x upscale (faster)")
                     Bitmap.createScaledBitmap(
                         mergedBitmap,
-                        width * 2,
-                        height * 2,
+                        mergedBitmap.width * 4,
+                        mergedBitmap.height * 4,
                         true
                     )
+                } else {
+                    // Only run SR on detail tiles
+                    Log.i(TAG, "Processing $detailTileCount detail tiles with SR")
+                    srProcessor?.process(
+                        mergedBitmap,
+                        detailMask,
+                        maskTileSize
+                    ) { processed, total, _ ->
+                        srTilesProcessed = processed
+                        _state.value = PipelineState.ApplyingSuperResolution(processed, total)
+                    } ?: run {
+                        // SR processor not available, use bicubic upscale (4x to match SR)
+                        Log.w(TAG, "SR processor not available, using bicubic 4x upscale")
+                        Bitmap.createScaledBitmap(
+                            mergedBitmap,
+                            mergedBitmap.width * 4,
+                            mergedBitmap.height * 4,
+                            true
+                        )
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "SR processing failed, using merged result", e)
@@ -373,7 +414,7 @@ class UltraDetailPipeline(
             }
             
             val processingTime = System.currentTimeMillis() - startTime
-            _state.value = PipelineState.Complete(finalBitmap, processingTime)
+            _state.value = PipelineState.Complete(finalBitmap, processingTime, frames.size)
             
             // Apply rotation correction (camera sensor is typically rotated 90 degrees)
             val rotatedBitmap = rotateBitmap(finalBitmap, 90f)
@@ -410,6 +451,413 @@ class UltraDetailPipeline(
     }
     
     /**
+     * Process high-quality captured frames (Bitmap-based).
+     * This is the preferred path when ImageCapture is used for full-resolution capture.
+     * 
+     * @param frames List of high-quality captured frames (Bitmaps)
+     * @param preset Processing preset
+     * @param scope Coroutine scope for processing
+     * @return Processing result
+     */
+    suspend fun processHighQuality(
+        frames: List<HighQualityCapturedFrame>,
+        preset: UltraDetailPreset,
+        scope: CoroutineScope
+    ): UltraDetailResult? = withContext(Dispatchers.Default) {
+        
+        val startTime = System.currentTimeMillis()
+        
+        if (frames.isEmpty()) {
+            _state.value = PipelineState.Error("No frames to process", null)
+            return@withContext null
+        }
+        
+        // Initialize MFSR pipeline for high-quality processing
+        if (mfsrPipeline == null) {
+            if (!initialize(preset)) {
+                _state.value = PipelineState.Error("Failed to initialize pipeline", null)
+                return@withContext null
+            }
+        }
+        
+        try {
+            val width = frames[0].width
+            val height = frames[0].height
+            
+            Log.i(TAG, "Processing ${frames.size} HQ frames (${width}x${height}) with preset $preset")
+            
+            // Analyze frame diversity
+            val frameDiversity = analyzeFrameDiversityHQ(frames)
+            Log.i(TAG, "HQ MFSR frame diversity: avgGyroMag=${"%.4f".format(frameDiversity.avgGyroMagnitude)}, " +
+                       "estimatedPixelShift=${"%.2f".format(frameDiversity.estimatedPixelShift)}px")
+            
+            if (frameDiversity.estimatedPixelShift < 0.5f) {
+                Log.w(TAG, "⚠️ Low frame diversity in HQ capture! Consider more hand movement.")
+            }
+            
+            // Select best reference frame based on sharpness and stability
+            val bestFrameIndex = selectBestFrameHQ(frames)
+            Log.i(TAG, "Selected HQ reference frame: $bestFrameIndex")
+            
+            // Determine processing path based on preset
+            return@withContext when (preset) {
+                UltraDetailPreset.FAST, UltraDetailPreset.BALANCED -> {
+                    // Simple merge - use best frame with optional averaging
+                    processHQSimpleMerge(frames, bestFrameIndex, preset, startTime)
+                }
+                UltraDetailPreset.MAX, UltraDetailPreset.ULTRA -> {
+                    // Full MFSR processing with Bitmaps
+                    processHQWithMFSR(frames, bestFrameIndex, preset, startTime)
+                }
+            }
+            
+        } catch (e: CancellationException) {
+            Log.d(TAG, "HQ Processing cancelled")
+            _state.value = PipelineState.Idle
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "HQ Pipeline processing failed", e)
+            _state.value = PipelineState.Error(e.message ?: "Unknown error", null)
+            null
+        }
+    }
+    
+    /**
+     * Simple merge for FAST/BALANCED presets with high-quality frames
+     */
+    private suspend fun processHQSimpleMerge(
+        frames: List<HighQualityCapturedFrame>,
+        referenceIndex: Int,
+        preset: UltraDetailPreset,
+        startTime: Long
+    ): UltraDetailResult {
+        _state.value = PipelineState.ProcessingBurst(
+            ProcessingStage.MERGING_FRAMES, 0f, "Merging high-quality frames..."
+        )
+        
+        // For simple merge, use the best frame directly (already high quality)
+        val bestFrame = frames[referenceIndex]
+        
+        // Create a copy of the bitmap (don't use the original which may be recycled)
+        val resultBitmap = bestFrame.bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        
+        val processingTime = System.currentTimeMillis() - startTime
+        _state.value = PipelineState.Complete(resultBitmap, processingTime, frames.size)
+        
+        Log.i(TAG, "HQ Simple merge complete: ${processingTime}ms, ${resultBitmap.width}x${resultBitmap.height}")
+        
+        return UltraDetailResult(
+            bitmap = resultBitmap,
+            processingTimeMs = processingTime,
+            framesUsed = frames.size,
+            detailTilesCount = 0,
+            srTilesProcessed = 0,
+            preset = preset,
+            mfsrApplied = false,
+            mfsrScaleFactor = 1,
+            mfsrCoveragePercent = 100f
+        )
+    }
+    
+    /**
+     * Full MFSR processing for MAX/ULTRA presets with high-quality frames
+     */
+    private suspend fun processHQWithMFSR(
+        frames: List<HighQualityCapturedFrame>,
+        referenceIndex: Int,
+        preset: UltraDetailPreset,
+        startTime: Long
+    ): UltraDetailResult? {
+        val pipeline = mfsrPipeline ?: return null
+        
+        val width = frames[0].width
+        val height = frames[0].height
+        val scaleFactor = 2
+        val outputWidth = width * scaleFactor
+        val outputHeight = height * scaleFactor
+        val inputMegapixels = (width * height) / 1_000_000f
+        val outputMegapixels = (outputWidth * outputHeight) / 1_000_000f
+        
+        Log.i(TAG, "═══════════════════════════════════════════════════════════")
+        Log.i(TAG, "║ HQ MFSR PIPELINE START")
+        Log.i(TAG, "║ Input: ${width}x${height} (${"%.2f".format(inputMegapixels)}MP) x ${frames.size} frames")
+        Log.i(TAG, "║ Output: ${outputWidth}x${outputHeight} (${"%.2f".format(outputMegapixels)}MP) @ ${scaleFactor}x scale")
+        Log.i(TAG, "║ Preset: $preset, Reference frame: $referenceIndex")
+        Log.i(TAG, "═══════════════════════════════════════════════════════════")
+        
+        // Stage 1: Compute gyro homographies
+        val stage1Start = System.currentTimeMillis()
+        _state.value = PipelineState.ProcessingBurst(
+            ProcessingStage.ALIGNING_FRAMES, 0.1f, "Computing gyro alignment..."
+        )
+        
+        val homographies = computeHomographiesFromHQFrames(frames)
+        val stage1Time = System.currentTimeMillis() - stage1Start
+        Log.i(TAG, "║ Stage 1: Gyro alignment computed in ${stage1Time}ms")
+        Log.i(TAG, "║   - Homographies: ${homographies?.size ?: 0} values (${frames.size} frames x 9 matrix elements)")
+        
+        // Stage 2: Compute RGB quality mask for pixel selection
+        val stage2Start = System.currentTimeMillis()
+        _state.value = PipelineState.ProcessingBurst(
+            ProcessingStage.ALIGNING_FRAMES, 0.4f, "Computing RGB quality mask..."
+        )
+        
+        val qualityResult = rgbQualityMask.computeFromMultipleFrames(frames.map { it.bitmap })
+        val stage2Time = System.currentTimeMillis() - stage2Start
+        Log.i(TAG, "║ Stage 2: RGB Quality Mask computed in ${stage2Time}ms")
+        Log.i(TAG, "║   - Alignment: ${"%.1f".format(qualityResult.alignmentPercentage)}% pixels well-aligned")
+        Log.i(TAG, "║   - Mask size: ${qualityResult.width}x${qualityResult.height} (${qualityResult.qualityMask.size} pixels)")
+        
+        // Log quality mask statistics
+        val maskMin = qualityResult.qualityMask.minOrNull() ?: 0f
+        val maskMax = qualityResult.qualityMask.maxOrNull() ?: 0f
+        val maskAvg = qualityResult.qualityMask.average().toFloat()
+        Log.i(TAG, "║   - Quality range: min=${"%.3f".format(maskMin)}, max=${"%.3f".format(maskMax)}, avg=${"%.3f".format(maskAvg)}")
+        
+        // Stage 3: Process through native MFSR pipeline with quality mask
+        val stage3Start = System.currentTimeMillis()
+        _state.value = PipelineState.ProcessingMFSR(0, 0, 0f)
+        
+        val outputBitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+        Log.i(TAG, "║ Stage 3: Native MFSR processing starting...")
+        Log.i(TAG, "║   - Input frames: ${frames.size}")
+        Log.i(TAG, "║   - Output bitmap allocated: ${outputWidth}x${outputHeight}")
+        Log.i(TAG, "║   - Quality mask: ${qualityResult.width}x${qualityResult.height} passed to native")
+        
+        // Use original bitmaps for MFSR processing with quality mask for pixel weighting
+        val bitmapArray = frames.map { it.bitmap }.toTypedArray()
+        
+        val mfsrResult = pipeline.processBitmapsWithQualityMask(
+            inputBitmaps = bitmapArray,
+            referenceIndex = referenceIndex,
+            homographies = homographies,
+            qualityMask = qualityResult.qualityMask,
+            maskWidth = qualityResult.width,
+            maskHeight = qualityResult.height,
+            outputBitmap = outputBitmap,
+            progressCallback = object : MFSRProgressCallback {
+                override fun onProgress(tilesProcessed: Int, totalTiles: Int, message: String, progress: Float) {
+                    _state.value = PipelineState.ProcessingMFSR(tilesProcessed, totalTiles, progress)
+                    if (tilesProcessed == totalTiles || tilesProcessed % 3 == 0) {
+                        Log.d(TAG, "║   - MFSR tile progress: $tilesProcessed/$totalTiles (${"%.0f".format(progress * 100)}%)")
+                    }
+                }
+            }
+        )
+        val stage3Time = System.currentTimeMillis() - stage3Start
+        Log.i(TAG, "║ Stage 3: Native MFSR completed in ${stage3Time}ms (result=$mfsrResult)")
+        
+        if (mfsrResult < 0) {
+            Log.e(TAG, "HQ MFSR processing failed with code: $mfsrResult")
+            _state.value = PipelineState.Error("MFSR processing failed", outputBitmap)
+            return UltraDetailResult(
+                bitmap = outputBitmap,
+                processingTimeMs = System.currentTimeMillis() - startTime,
+                framesUsed = frames.size,
+                detailTilesCount = 0,
+                srTilesProcessed = 0,
+                preset = preset,
+                mfsrApplied = false,
+                mfsrScaleFactor = scaleFactor,
+                mfsrCoveragePercent = 0f,
+                alignmentQuality = qualityResult.alignmentPercentage
+            )
+        }
+        
+        // Stage 4: Neural refinement (optional, ULTRA preset only)
+        val stage4Start = System.currentTimeMillis()
+        val finalBitmap = if (mfsrRefiner?.isReady() == true && preset == UltraDetailPreset.ULTRA) {
+            Log.i(TAG, "║ Stage 4: Neural refinement starting (ULTRA preset)...")
+            _state.value = PipelineState.RefiningMFSR(0, 0)
+            
+            try {
+                mfsrRefiner!!.refine(outputBitmap) { processed, total, _ ->
+                    _state.value = PipelineState.RefiningMFSR(processed, total)
+                }.also {
+                    if (it !== outputBitmap) {
+                        outputBitmap.recycle()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "║ Stage 4: Refinement failed, using MFSR output", e)
+                outputBitmap
+            }
+        } else {
+            Log.i(TAG, "║ Stage 4: Neural refinement SKIPPED (preset=$preset, refiner ready=${mfsrRefiner?.isReady()})")
+            outputBitmap
+        }
+        val stage4Time = System.currentTimeMillis() - stage4Start
+        if (preset == UltraDetailPreset.ULTRA) {
+            Log.i(TAG, "║ Stage 4: Neural refinement completed in ${stage4Time}ms")
+        }
+        
+        val processingTime = System.currentTimeMillis() - startTime
+        _state.value = PipelineState.Complete(finalBitmap, processingTime, frames.size)
+        
+        val finalMegapixels = (finalBitmap.width * finalBitmap.height) / 1_000_000f
+        Log.i(TAG, "═══════════════════════════════════════════════════════════")
+        Log.i(TAG, "║ HQ MFSR PIPELINE COMPLETE")
+        Log.i(TAG, "║ Total time: ${processingTime}ms")
+        Log.i(TAG, "║ Output: ${finalBitmap.width}x${finalBitmap.height} (${"%.2f".format(finalMegapixels)}MP)")
+        Log.i(TAG, "║ Stages: Gyro=${stage1Time}ms, RGBMask=${stage2Time}ms, MFSR=${stage3Time}ms, Refine=${stage4Time}ms")
+        Log.i(TAG, "═══════════════════════════════════════════════════════════")
+        
+        // Calculate actual scale factor (ULTRA = MFSR 2x * ESRGAN 4x = 8x)
+        val actualScaleFactor = if (preset == UltraDetailPreset.ULTRA && mfsrRefiner?.isReady() == true) {
+            scaleFactor * mfsrRefiner!!.getScaleFactor()
+        } else {
+            scaleFactor
+        }
+        
+        return UltraDetailResult(
+            bitmap = finalBitmap,
+            processingTimeMs = processingTime,
+            framesUsed = frames.size,
+            detailTilesCount = 0,
+            srTilesProcessed = (width / 256) * (height / 256),
+            preset = preset,
+            mfsrApplied = true,
+            mfsrScaleFactor = actualScaleFactor,
+            mfsrCoveragePercent = 100f,
+            alignmentQuality = qualityResult.alignmentPercentage
+        )
+    }
+    
+    /**
+     * Compute homographies from high-quality frames using gyro data
+     */
+    private fun computeHomographiesFromHQFrames(frames: List<HighQualityCapturedFrame>): List<Homography> {
+        if (frames.isEmpty()) return emptyList()
+        
+        val homographies = mutableListOf<Homography>()
+        val referenceFrame = frames[0]
+        
+        for (frame in frames) {
+            if (frame === referenceFrame) {
+                homographies.add(Homography.identity())
+            } else {
+                // Compute homography from gyro samples
+                val allSamples = mutableListOf<GyroSample>()
+                allSamples.addAll(referenceFrame.gyroSamples)
+                allSamples.addAll(frame.gyroSamples)
+                allSamples.sortBy { it.timestamp }
+                
+                val rotation = gyroHelper.integrateGyroRotation(allSamples)
+                val homography = gyroHelper.rotationToHomography(rotation, frame.width, frame.height)
+                homographies.add(homography)
+            }
+        }
+        
+        return homographies
+    }
+    
+    /**
+     * Select best frame from high-quality captures based on sharpness and gyro stability
+     */
+    private fun selectBestFrameHQ(frames: List<HighQualityCapturedFrame>): Int {
+        if (frames.size <= 1) return 0
+        
+        val metrics = frames.mapIndexed { index, frame ->
+            val gyroMag = computeGyroMagnitude(frame.gyroSamples)
+            val sharpness = computeBitmapSharpness(frame.bitmap)
+            Triple(index, gyroMag, sharpness)
+        }
+        
+        // Normalize and score
+        val maxGyro = metrics.maxOfOrNull { it.second } ?: 1f
+        val minGyro = metrics.minOfOrNull { it.second } ?: 0f
+        val gyroRange = (maxGyro - minGyro).coerceAtLeast(0.001f)
+        
+        val maxSharp = metrics.maxOfOrNull { it.third } ?: 1f
+        val minSharp = metrics.minOfOrNull { it.third } ?: 0f
+        val sharpRange = (maxSharp - minSharp).coerceAtLeast(0.001f)
+        
+        var bestIndex = 0
+        var bestScore = Float.MIN_VALUE
+        
+        metrics.forEach { (index, gyro, sharpness) ->
+            val gyroScore = 1f - (gyro - minGyro) / gyroRange
+            val sharpScore = (sharpness - minSharp) / sharpRange
+            val combinedScore = 0.4f * gyroScore + 0.6f * sharpScore
+            
+            Log.d(TAG, "HQ Frame $index: gyro=${"%.4f".format(gyro)}, sharp=${"%.1f".format(sharpness)}, score=${"%.3f".format(combinedScore)}")
+            
+            if (combinedScore > bestScore) {
+                bestScore = combinedScore
+                bestIndex = index
+            }
+        }
+        
+        return bestIndex
+    }
+    
+    /**
+     * Compute sharpness of a Bitmap using Laplacian variance
+     */
+    private fun computeBitmapSharpness(bitmap: Bitmap): Float {
+        val width = bitmap.width
+        val height = bitmap.height
+        
+        val sampleSize = minOf(128, width / 4, height / 4)
+        val startX = (width - sampleSize) / 2
+        val startY = (height - sampleSize) / 2
+        
+        var sum = 0.0
+        var sumSq = 0.0
+        var count = 0
+        
+        for (y in startY until (startY + sampleSize - 2) step 2) {
+            for (x in startX until (startX + sampleSize - 2) step 2) {
+                val center = getGrayscale(bitmap, x, y)
+                val up = getGrayscale(bitmap, x, y - 1)
+                val down = getGrayscale(bitmap, x, y + 1)
+                val left = getGrayscale(bitmap, x - 1, y)
+                val right = getGrayscale(bitmap, x + 1, y)
+                
+                val laplacian = 4f * center - up - down - left - right
+                sum += laplacian
+                sumSq += laplacian * laplacian
+                count++
+            }
+        }
+        
+        if (count == 0) return 0f
+        val mean = sum / count
+        val variance = (sumSq / count) - (mean * mean)
+        return variance.toFloat().coerceAtLeast(0f)
+    }
+    
+    private fun getGrayscale(bitmap: Bitmap, x: Int, y: Int): Float {
+        val pixel = bitmap.getPixel(x, y)
+        val r = (pixel shr 16) and 0xFF
+        val g = (pixel shr 8) and 0xFF
+        val b = pixel and 0xFF
+        return 0.299f * r + 0.587f * g + 0.114f * b
+    }
+    
+    /**
+     * Analyze frame diversity for high-quality frames
+     */
+    private fun analyzeFrameDiversityHQ(frames: List<HighQualityCapturedFrame>): FrameDiversityAnalysis {
+        if (frames.isEmpty()) {
+            return FrameDiversityAnalysis(0f, 0f, 0f)
+        }
+        
+        val gyroMagnitudes = frames.map { computeGyroMagnitude(it.gyroSamples) }
+        val avgGyro = gyroMagnitudes.average().toFloat()
+        val maxGyro = gyroMagnitudes.maxOrNull() ?: 0f
+        
+        val focalLengthPx = 3000f
+        val estimatedPixelShift = maxGyro * focalLengthPx
+        
+        return FrameDiversityAnalysis(
+            avgGyroMagnitude = avgGyro,
+            maxGyroMagnitude = maxGyro,
+            estimatedPixelShift = estimatedPixelShift
+        )
+    }
+    
+    /**
      * Process frames using ULTRA preset (MFSR + neural refinement)
      * 
      * Uses direct YUV processing to avoid ~360MB memory spike from RGB conversion.
@@ -428,6 +876,17 @@ class UltraDetailPipeline(
         val outputHeight = height * scaleFactor
         
         Log.i(TAG, "Processing ${frames.size} frames with ULTRA preset: ${width}x${height} -> ${outputWidth}x${outputHeight}")
+        
+        // Analyze frame diversity for MFSR effectiveness
+        val frameDiversity = analyzeFrameDiversity(frames)
+        Log.i(TAG, "MFSR frame diversity analysis: avgGyroMag=${"%.4f".format(frameDiversity.avgGyroMagnitude)}, " +
+                   "maxGyroMag=${"%.4f".format(frameDiversity.maxGyroMagnitude)}, " +
+                   "estimatedPixelShift=${"%.2f".format(frameDiversity.estimatedPixelShift)}px")
+        
+        if (frameDiversity.estimatedPixelShift < 0.5f) {
+            Log.w(TAG, "⚠️ Low frame diversity detected! Hand movement may be insufficient for effective MFSR. " +
+                       "Estimated sub-pixel shift: ${"%.2f".format(frameDiversity.estimatedPixelShift)}px (need >0.5px)")
+        }
         
         // Stage 1: Compute gyro homographies
         _state.value = PipelineState.ProcessingBurst(
@@ -501,7 +960,7 @@ class UltraDetailPipeline(
         }
         
         val processingTime = System.currentTimeMillis() - startTime
-        _state.value = PipelineState.Complete(rotatedBitmap, processingTime)
+        _state.value = PipelineState.Complete(rotatedBitmap, processingTime, frames.size)
         
         Log.i(TAG, "ULTRA pipeline complete: ${processingTime}ms, ${rotatedBitmap.width}x${rotatedBitmap.height}")
         
@@ -558,24 +1017,111 @@ class UltraDetailPipeline(
     }
     
     /**
-     * Select the best frame based on gyro stability (lowest total rotation)
+     * Select the best frame based on gyro stability AND image sharpness
+     * 
+     * Combines two metrics:
+     * 1. Gyro stability (lower rotation = better)
+     * 2. Image sharpness (higher Laplacian variance = sharper)
+     * 
+     * This avoids selecting a stable but blurry frame.
      */
     private fun selectBestFrame(frames: List<CapturedFrame>): Int {
         if (frames.size <= 1) return 0
         
-        var bestIndex = 0
-        var minRotation = Float.MAX_VALUE
+        // Compute metrics for each frame
+        val metrics = frames.mapIndexed { index, frame ->
+            val gyroMag = computeGyroMagnitude(frame.gyroSamples)
+            val sharpness = computeFrameSharpness(frame)
+            Triple(index, gyroMag, sharpness)
+        }
         
-        frames.forEachIndexed { index, frame ->
-            val rotation = computeGyroMagnitude(frame.gyroSamples)
-            if (rotation < minRotation) {
-                minRotation = rotation
+        // Normalize metrics (0-1 range)
+        val maxGyro = metrics.maxOfOrNull { it.second } ?: 1f
+        val minGyro = metrics.minOfOrNull { it.second } ?: 0f
+        val gyroRange = (maxGyro - minGyro).coerceAtLeast(0.001f)
+        
+        val maxSharp = metrics.maxOfOrNull { it.third } ?: 1f
+        val minSharp = metrics.minOfOrNull { it.third } ?: 0f
+        val sharpRange = (maxSharp - minSharp).coerceAtLeast(0.001f)
+        
+        // Score each frame: lower gyro is better, higher sharpness is better
+        // Weight: 40% gyro stability, 60% sharpness (sharpness is more important for quality)
+        var bestIndex = 0
+        var bestScore = Float.MIN_VALUE
+        
+        metrics.forEach { (index, gyro, sharpness) ->
+            val gyroScore = 1f - (gyro - minGyro) / gyroRange  // Invert: lower gyro = higher score
+            val sharpScore = (sharpness - minSharp) / sharpRange
+            val combinedScore = 0.4f * gyroScore + 0.6f * sharpScore
+            
+            Log.d(TAG, "Frame $index: gyro=${"%.4f".format(gyro)}, sharp=${"%.1f".format(sharpness)}, score=${"%.3f".format(combinedScore)}")
+            
+            if (combinedScore > bestScore) {
+                bestScore = combinedScore
                 bestIndex = index
             }
         }
         
-        Log.d(TAG, "Selected best frame: $bestIndex (gyro magnitude: $minRotation)")
+        Log.i(TAG, "Selected best frame: $bestIndex (score: ${"%.3f".format(bestScore)})")
         return bestIndex
+    }
+    
+    /**
+     * Compute image sharpness using Laplacian variance on Y channel
+     * Higher value = sharper image
+     */
+    private fun computeFrameSharpness(frame: CapturedFrame): Float {
+        val yBuffer = frame.yPlane
+        yBuffer.rewind()
+        
+        val width = frame.width
+        val height = frame.height
+        val rowStride = frame.yRowStride
+        
+        // Sample center region (avoid edges which may have vignetting)
+        val sampleSize = 128
+        val startX = (width - sampleSize) / 2
+        val startY = (height - sampleSize) / 2
+        
+        var sum = 0.0
+        var sumSq = 0.0
+        var count = 0
+        
+        // Compute Laplacian (second derivative) at sampled points
+        for (y in startY until (startY + sampleSize - 2) step 2) {
+            for (x in startX until (startX + sampleSize - 2) step 2) {
+                val idx = y * rowStride + x
+                val idxUp = (y - 1) * rowStride + x
+                val idxDown = (y + 1) * rowStride + x
+                val idxLeft = y * rowStride + (x - 1)
+                val idxRight = y * rowStride + (x + 1)
+                
+                // Bounds check
+                if (idxUp < 0 || idxDown >= yBuffer.capacity() || 
+                    idxLeft < 0 || idxRight >= yBuffer.capacity()) continue
+                
+                val center = (yBuffer.get(idx).toInt() and 0xFF).toFloat()
+                val up = (yBuffer.get(idxUp).toInt() and 0xFF).toFloat()
+                val down = (yBuffer.get(idxDown).toInt() and 0xFF).toFloat()
+                val left = (yBuffer.get(idxLeft).toInt() and 0xFF).toFloat()
+                val right = (yBuffer.get(idxRight).toInt() and 0xFF).toFloat()
+                
+                // Laplacian = 4*center - up - down - left - right
+                val laplacian = 4f * center - up - down - left - right
+                
+                sum += laplacian
+                sumSq += laplacian * laplacian
+                count++
+            }
+        }
+        
+        if (count == 0) return 0f
+        
+        // Variance of Laplacian (higher = sharper)
+        val mean = sum / count
+        val variance = (sumSq / count) - (mean * mean)
+        
+        return variance.toFloat().coerceAtLeast(0f)
     }
     
     /**
@@ -596,6 +1142,46 @@ class UltraDetailPipeline(
         }
         
         return totalRotation
+    }
+    
+    /**
+     * Frame diversity analysis result
+     */
+    private data class FrameDiversityAnalysis(
+        val avgGyroMagnitude: Float,
+        val maxGyroMagnitude: Float,
+        val estimatedPixelShift: Float  // Estimated sub-pixel shift in pixels
+    )
+    
+    /**
+     * Analyze frame diversity to predict MFSR effectiveness
+     * 
+     * MFSR requires sub-pixel shifts between frames to reconstruct higher resolution.
+     * If all frames are nearly identical (no hand movement), MFSR degrades to simple averaging.
+     * 
+     * @return Analysis with estimated pixel shift and gyro statistics
+     */
+    private fun analyzeFrameDiversity(frames: List<CapturedFrame>): FrameDiversityAnalysis {
+        if (frames.isEmpty()) {
+            return FrameDiversityAnalysis(0f, 0f, 0f)
+        }
+        
+        // Compute gyro magnitude for each frame
+        val gyroMagnitudes = frames.map { computeGyroMagnitude(it.gyroSamples) }
+        val avgGyro = gyroMagnitudes.average().toFloat()
+        val maxGyro = gyroMagnitudes.maxOrNull() ?: 0f
+        
+        // Estimate pixel shift from gyro rotation
+        // Rough approximation: rotation (rad) * focal_length (px) = pixel shift
+        // Typical smartphone focal length ~3000px for 12MP sensor
+        val focalLengthPx = 3000f
+        val estimatedPixelShift = maxGyro * focalLengthPx
+        
+        return FrameDiversityAnalysis(
+            avgGyroMagnitude = avgGyro,
+            maxGyroMagnitude = maxGyro,
+            estimatedPixelShift = estimatedPixelShift
+        )
     }
     
     /**

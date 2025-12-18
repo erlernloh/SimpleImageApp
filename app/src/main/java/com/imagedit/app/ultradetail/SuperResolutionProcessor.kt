@@ -59,7 +59,8 @@ data class SRConfig(
     val overlap: Int = 8,     // Overlap for seamless tiling
     val acceleration: SRAcceleration = SRAcceleration.GPU,
     val numThreads: Int = 4,
-    val modelPath: String = "models/esrgan.tflite"
+    val modelPath: String = "models/esrgan.tflite",
+    val useExternalModel: Boolean = true  // Load from app files instead of assets
 )
 
 /**
@@ -428,15 +429,28 @@ class SuperResolutionProcessor(
     }
     
     /**
-     * Load TFLite model from assets
+     * Load TFLite model from assets or external file
      */
     private fun loadModel(modelPath: String): MappedByteBuffer {
-        val assetFileDescriptor = context.assets.openFd(modelPath)
-        val inputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
-        val fileChannel = inputStream.channel
-        val startOffset = assetFileDescriptor.startOffset
-        val declaredLength = assetFileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+        return if (config.useExternalModel) {
+            // Load from app's internal files directory
+            val modelFile = java.io.File(context.filesDir, modelPath)
+            if (!modelFile.exists()) {
+                throw java.io.FileNotFoundException("Model not found: ${modelFile.absolutePath}")
+            }
+            Log.d(TAG, "Loading model from: ${modelFile.absolutePath} (${modelFile.length()} bytes)")
+            val inputStream = FileInputStream(modelFile)
+            val fileChannel = inputStream.channel
+            fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, modelFile.length())
+        } else {
+            // Load from assets
+            val assetFileDescriptor = context.assets.openFd(modelPath)
+            val inputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
+            val fileChannel = inputStream.channel
+            val startOffset = assetFileDescriptor.startOffset
+            val declaredLength = assetFileDescriptor.declaredLength
+            fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+        }
     }
     
     override fun close() {

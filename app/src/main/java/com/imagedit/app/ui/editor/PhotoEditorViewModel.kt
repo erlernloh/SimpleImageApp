@@ -1870,21 +1870,17 @@ class PhotoEditorViewModel @Inject constructor(
     
     /**
      * Analyzes the current image for landscape elements.
+     * 
+     * Note: Landscape analysis is not implemented for MVP. The landscape enhancement
+     * feature still works without analysis - it just won't show detected elements
+     * in the UI. Users can still manually apply landscape enhancement.
+     * 
+     * TODO (Post-MVP): Inject LandscapeDetector and implement proper analysis
      */
     fun analyzeLandscapeElements() {
-        val bitmap = _uiState.value.processedBitmap ?: _uiState.value.originalBitmap ?: return
-        
-        viewModelScope.launch {
-            try {
-                // This would require adding LandscapeDetector to the ViewModel dependencies
-                // For now, we'll set a placeholder analysis
-                _uiState.value = _uiState.value.copy(
-                    landscapeAnalysis = null // Will be populated when LandscapeDetector is injected
-                )
-            } catch (e: Exception) {
-                Log.e("PhotoEditorViewModel", "Failed to analyze landscape elements", e)
-            }
-        }
+        // Landscape analysis not implemented for MVP
+        // Enhancement still works via manual controls in LandscapeEnhancementCard
+        _uiState.value = _uiState.value.copy(landscapeAnalysis = null)
     }
     
     /**
@@ -1909,6 +1905,86 @@ class PhotoEditorViewModel @Inject constructor(
     }
     
     // Healing Tool Methods
+    
+    // Healing coordinate mapping state
+    private var healingContentRect: androidx.compose.ui.geometry.Rect? = null
+    private var healingBitmapWidth: Int = 0
+    private var healingBitmapHeight: Int = 0
+    
+    /**
+     * Sets the healing image bounds for coordinate mapping.
+     * Called from the UI when the image container size changes.
+     */
+    fun setHealingImageBounds(contentRect: androidx.compose.ui.geometry.Rect, bitmapWidth: Int, bitmapHeight: Int) {
+        healingContentRect = contentRect
+        healingBitmapWidth = bitmapWidth
+        healingBitmapHeight = bitmapHeight
+    }
+    
+    /**
+     * Converts screen coordinates to bitmap coordinates.
+     * Returns null if the point is outside the image bounds.
+     */
+    private fun screenToBitmapCoordinates(screenX: Float, screenY: Float): android.graphics.PointF? {
+        val rect = healingContentRect ?: return null
+        if (healingBitmapWidth <= 0 || healingBitmapHeight <= 0) return null
+        
+        // Check if point is within the content rect
+        if (screenX < rect.left || screenX > rect.right ||
+            screenY < rect.top || screenY > rect.bottom) {
+            return null
+        }
+        
+        // Normalize to 0-1 range within the content rect
+        val normalizedX = (screenX - rect.left) / rect.width
+        val normalizedY = (screenY - rect.top) / rect.height
+        
+        // Scale to bitmap dimensions
+        val bitmapX = normalizedX * healingBitmapWidth
+        val bitmapY = normalizedY * healingBitmapHeight
+        
+        return android.graphics.PointF(bitmapX, bitmapY)
+    }
+    
+    /**
+     * Converts bitmap coordinates to screen coordinates for visual feedback.
+     */
+    private fun bitmapToScreenCoordinates(bitmapX: Float, bitmapY: Float): androidx.compose.ui.geometry.Offset? {
+        val rect = healingContentRect ?: return null
+        if (healingBitmapWidth <= 0 || healingBitmapHeight <= 0) return null
+        
+        // Normalize from bitmap dimensions to 0-1 range
+        val normalizedX = bitmapX / healingBitmapWidth
+        val normalizedY = bitmapY / healingBitmapHeight
+        
+        // Scale to screen coordinates within content rect
+        val screenX = rect.left + normalizedX * rect.width
+        val screenY = rect.top + normalizedY * rect.height
+        
+        return androidx.compose.ui.geometry.Offset(screenX, screenY)
+    }
+    
+    /**
+     * Gets the current healing stroke as screen coordinates for visual feedback.
+     * Returns list of screen coordinate points.
+     */
+    fun getCurrentHealingStrokeScreenPoints(): List<androidx.compose.ui.geometry.Offset> {
+        val stroke = currentHealingStroke ?: return emptyList()
+        return stroke.mapNotNull { point ->
+            bitmapToScreenCoordinates(point.x, point.y)
+        }
+    }
+    
+    /**
+     * Gets all completed healing strokes as screen coordinates for visual feedback.
+     */
+    fun getCompletedHealingStrokesScreenPoints(): List<List<androidx.compose.ui.geometry.Offset>> {
+        return _uiState.value.healingStrokes.map { stroke ->
+            stroke.points.mapNotNull { point ->
+                bitmapToScreenCoordinates(point.x, point.y)
+            }
+        }
+    }
     
     /**
      * Activates healing tool mode.
@@ -2057,7 +2133,10 @@ class PhotoEditorViewModel @Inject constructor(
                     bitmap, 
                     strokes, 
                     brushSettings, 
-                    mode
+                    mode,
+                    progressCallback = { progress ->
+                        _uiState.value = _uiState.value.copy(healingProgress = progress)
+                    }
                 )
                 
                 result.fold(
@@ -2156,18 +2235,29 @@ class PhotoEditorViewModel @Inject constructor(
     
     /**
      * Starts a new healing stroke.
+     * Coordinates are in screen space and will be converted to bitmap space.
      */
-    fun startHealingStroke(x: Float, y: Float, pressure: Float) {
-        // Create a new stroke starting point
-        val points = mutableListOf(android.graphics.PointF(x, y))
-        currentHealingStroke = points
+    fun startHealingStroke(screenX: Float, screenY: Float, pressure: Float) {
+        // Convert screen coordinates to bitmap coordinates
+        val bitmapPoint = screenToBitmapCoordinates(screenX, screenY)
+        if (bitmapPoint != null) {
+            val points = mutableListOf(bitmapPoint)
+            currentHealingStroke = points
+        } else {
+            // Point is outside image bounds, ignore
+            currentHealingStroke = null
+        }
     }
     
     /**
      * Adds a point to the current healing stroke.
+     * Coordinates are in screen space and will be converted to bitmap space.
      */
-    fun addHealingStrokePoint(x: Float, y: Float, pressure: Float) {
-        currentHealingStroke?.add(android.graphics.PointF(x, y))
+    fun addHealingStrokePoint(screenX: Float, screenY: Float, pressure: Float) {
+        val bitmapPoint = screenToBitmapCoordinates(screenX, screenY)
+        if (bitmapPoint != null) {
+            currentHealingStroke?.add(bitmapPoint)
+        }
     }
     
     /**

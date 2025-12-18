@@ -15,6 +15,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
@@ -27,6 +29,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -35,7 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -52,7 +55,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun UltraDetailScreen(
     onNavigateBack: () -> Unit,
-    onImageCaptured: (android.graphics.Bitmap) -> Unit,
+    onImageSaved: () -> Unit,
     viewModel: UltraDetailViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
@@ -94,31 +97,56 @@ fun UltraDetailScreen(
         viewModel.initialize()
     }
     
-    // Setup camera only when permission is granted
-    LaunchedEffect(previewView, hasCameraPermission) {
+    // Setup camera when permission is granted or preset changes
+    // Recreating the controller ensures correct capture quality for the selected preset
+    LaunchedEffect(previewView, hasCameraPermission, uiState.selectedPreset) {
         if (!hasCameraPermission) return@LaunchedEffect
         
         previewView?.let { view ->
+            // Release existing controller before creating new one
+            burstController?.release()
+            
             val providerFuture = ProcessCameraProvider.getInstance(context)
             providerFuture.addListener({
                 cameraProvider = providerFuture.get()
                 
+                val resolutionSelector = ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(1920, 1080),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        )
+                    )
+                    .build()
                 val preview = Preview.Builder()
-                    .setTargetResolution(Size(1920, 1080))
+                    .setResolutionSelector(resolutionSelector)
                     .build()
                     .also {
                         it.setSurfaceProvider(view.surfaceProvider)
                     }
                 
                 // Create burst controller
+                // Configure capture quality: MAX and ULTRA use high-quality ImageCapture
                 val config = BurstCaptureConfig(
                     frameCount = when (uiState.selectedPreset) {
                         UltraDetailPreset.FAST -> 6
                         UltraDetailPreset.BALANCED -> 8
                         UltraDetailPreset.MAX -> 12
-                        UltraDetailPreset.ULTRA -> 4  // Reduced for faster processing (4 frames is enough for MFSR)
+                        UltraDetailPreset.ULTRA -> 10  // 10 frames for MFSR - needs variation from hand movement
                     },
-                    targetResolution = Size(4000, 3000)
+                    targetResolution = Size(4000, 3000),
+                    frameIntervalMs = when (uiState.selectedPreset) {
+                        UltraDetailPreset.FAST -> 100L      // 100ms between frames
+                        UltraDetailPreset.BALANCED -> 120L  // 120ms between frames
+                        UltraDetailPreset.MAX -> 150L       // 150ms between frames
+                        UltraDetailPreset.ULTRA -> 200L     // 200ms between frames for more hand movement variation
+                    },
+                    captureQuality = when (uiState.selectedPreset) {
+                        UltraDetailPreset.FAST -> CaptureQuality.PREVIEW       // Fast: use preview for speed
+                        UltraDetailPreset.BALANCED -> CaptureQuality.PREVIEW   // Balanced: use preview
+                        UltraDetailPreset.MAX -> CaptureQuality.HIGH_QUALITY   // Max: use full-res capture
+                        UltraDetailPreset.ULTRA -> CaptureQuality.HIGH_QUALITY // Ultra: use full-res capture
+                    }
                 )
                 
                 burstController = BurstCaptureController(context, config).apply {
@@ -142,6 +170,15 @@ fun UltraDetailScreen(
         }
     }
     
+    // Model download dialog - must be at top level for proper touch handling
+    if (uiState.showModelDownloadDialog) {
+        ModelDownloadDialog(
+            downloadState = uiState.modelDownloadState,
+            onDownload = { viewModel.downloadModel() },
+            onDismiss = { viewModel.dismissModelDownloadDialog() }
+        )
+    }
+    
     Scaffold(
         topBar = {
             TopAppBar(
@@ -153,14 +190,19 @@ fun UltraDetailScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
                     // Preset selector
                     PresetSelector(
                         selectedPreset = uiState.selectedPreset,
-                        onPresetSelected = { viewModel.setPreset(it) },
+                        onPresetSelected = { preset ->
+                            // Check if model is needed for MAX preset
+                            if (viewModel.checkModelForPreset(preset)) {
+                                viewModel.setPreset(preset)
+                            }
+                        },
                         enabled = !uiState.isCapturing && !uiState.isProcessing
                     )
                 }
@@ -198,7 +240,10 @@ fun UltraDetailScreen(
                     isSaved = uiState.savedUri != null,
                     onSave = { 
                         viewModel.saveResult { uri ->
-                            onImageCaptured(uiState.resultBitmap!!)
+                            // Clear the large bitmap from memory before navigating
+                            // to prevent OOM when gallery loads
+                            viewModel.clearResult()
+                            onImageSaved()
                         }
                     },
                     onRetake = { viewModel.clearResult() },
@@ -226,6 +271,23 @@ fun UltraDetailScreen(
                     UltraSettingsPanel(
                         refinementStrength = uiState.refinementStrength,
                         onRefinementStrengthChange = { viewModel.setRefinementStrength(it) }
+                    )
+                }
+                
+                // Non-ULTRA mode settings panel (denoising strength)
+                AnimatedVisibility(
+                    visible = uiState.selectedPreset != UltraDetailPreset.ULTRA && 
+                              !uiState.isCapturing && !uiState.isProcessing,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
+                ) {
+                    DenoiseSettingsPanel(
+                        denoiseStrength = uiState.denoiseStrength,
+                        onDenoiseStrengthChange = { viewModel.setDenoiseStrength(it) },
+                        preset = uiState.selectedPreset
                     )
                 }
                 
@@ -269,6 +331,100 @@ fun UltraDetailScreen(
 }
 
 /**
+ * Dialog for downloading the SR model
+ */
+@Composable
+private fun ModelDownloadDialog(
+    downloadState: DownloadState,
+    onDownload: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = { 
+            if (downloadState !is DownloadState.Downloading && downloadState !is DownloadState.Extracting) {
+                onDismiss()
+            }
+        },
+        title = { Text("AI Model Required") },
+        text = {
+            Column {
+                when (downloadState) {
+                    is DownloadState.Idle, is DownloadState.Checking -> {
+                        Text(
+                            "The Maximum Detail preset requires an AI super-resolution model " +
+                            "that needs to be downloaded (~20MB).\n\n" +
+                            "This is a one-time download."
+                        )
+                    }
+                    is DownloadState.Downloading -> {
+                        Text("Downloading AI model...")
+                        Spacer(modifier = Modifier.height(16.dp))
+                        LinearProgressIndicator(
+                            progress = { downloadState.progress },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = String.format("%.1f MB / %.1f MB", 
+                                downloadState.downloadedMB, 
+                                downloadState.totalMB),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    is DownloadState.Extracting -> {
+                        Text("Extracting model...")
+                        Spacer(modifier = Modifier.height(16.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    is DownloadState.Complete -> {
+                        Text("Download complete! You can now use Maximum Detail mode.")
+                    }
+                    is DownloadState.Error -> {
+                        Text(
+                            "Download failed: ${downloadState.message}\n\n" +
+                            "Please check your internet connection and try again.",
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            when (downloadState) {
+                is DownloadState.Idle, is DownloadState.Checking -> {
+                    Button(onClick = onDownload) {
+                        Text("Download")
+                    }
+                }
+                is DownloadState.Downloading, is DownloadState.Extracting -> {
+                    // No button during download
+                }
+                is DownloadState.Complete -> {
+                    Button(onClick = onDismiss) {
+                        Text("Done")
+                    }
+                }
+                is DownloadState.Error -> {
+                    Button(onClick = onDownload) {
+                        Text("Retry")
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            if (downloadState is DownloadState.Idle || 
+                downloadState is DownloadState.Checking ||
+                downloadState is DownloadState.Error) {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel")
+                }
+            }
+        }
+    )
+}
+
+/**
  * Preset selector dropdown
  */
 @Composable
@@ -303,7 +459,7 @@ private fun PresetSelector(
                 text = {
                     Column {
                         Text("⚡ Quick", fontWeight = FontWeight.Bold)
-                        Text("Fast noise reduction • 6 photos", 
+                        Text("Fast noise reduction • 6 photos (~0.6s capture)", 
                             style = MaterialTheme.typography.bodySmall, 
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -317,7 +473,7 @@ private fun PresetSelector(
                 text = {
                     Column {
                         Text("✨ Balanced", fontWeight = FontWeight.Bold)
-                        Text("Better details & less noise • 8 photos", 
+                        Text("Better details & less noise • 8 photos (~1s capture)", 
                             style = MaterialTheme.typography.bodySmall, 
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -331,7 +487,7 @@ private fun PresetSelector(
                 text = {
                     Column {
                         Text("🔍 Maximum", fontWeight = FontWeight.Bold)
-                        Text("AI-enhanced sharpness • 12 photos", 
+                        Text("Full-res capture + MFSR • 12 HQ photos (~3s capture)", 
                             style = MaterialTheme.typography.bodySmall, 
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -345,7 +501,7 @@ private fun PresetSelector(
                 text = {
                     Column {
                         Text("🚀 Ultra Resolution", fontWeight = FontWeight.Bold)
-                        Text("2× larger image with AI polish • 10 photos", 
+                        Text("2× larger + AI polish • 10 HQ photos (~4s capture)", 
                             style = MaterialTheme.typography.bodySmall, 
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -615,10 +771,10 @@ private fun CaptureControls(
                     )
                     Text(
                         text = when (preset) {
-                            UltraDetailPreset.FAST -> "Takes 6 photos • ~2 sec"
-                            UltraDetailPreset.BALANCED -> "Takes 8 photos • ~3 sec"
-                            UltraDetailPreset.MAX -> "Takes 12 photos • ~5 sec"
-                            UltraDetailPreset.ULTRA -> "Takes 4 photos • 2× resolution • ~60 sec"
+                            UltraDetailPreset.FAST -> "Takes 6 photos • ~3 sec total"
+                            UltraDetailPreset.BALANCED -> "Takes 8 photos • ~5 sec total"
+                            UltraDetailPreset.MAX -> "Takes 12 photos • ~8 sec total"
+                            UltraDetailPreset.ULTRA -> "Takes 10 photos • 2× resolution • ~60 sec"
                         },
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                         style = MaterialTheme.typography.bodySmall
@@ -672,10 +828,28 @@ private fun ResultView(
     onRetake: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    // Create a display-safe preview bitmap (max 2048px on longest edge)
+    // This prevents Canvas crash for very large bitmaps (e.g., 10240x7680)
+    val displayBitmap = remember(bitmap) {
+        val maxDisplaySize = 2048
+        val width = bitmap.width
+        val height = bitmap.height
+        val maxDimension = maxOf(width, height)
+        
+        if (maxDimension <= maxDisplaySize) {
+            bitmap // Already small enough
+        } else {
+            val scale = maxDisplaySize.toFloat() / maxDimension
+            val newWidth = (width * scale).toInt()
+            val newHeight = (height * scale).toInt()
+            android.graphics.Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+        }
+    }
+    
     Column(modifier = modifier) {
-        // Image
+        // Image (using display-safe preview)
         Image(
-            bitmap = bitmap.asImageBitmap(),
+            bitmap = displayBitmap.asImageBitmap(),
             contentDescription = "Captured image",
             modifier = Modifier
                 .weight(1f)
@@ -831,6 +1005,96 @@ private fun StatItem(label: String, value: String) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+    }
+}
+
+/**
+ * Settings panel for denoising strength (FAST/BALANCED/MAX modes)
+ */
+@Composable
+private fun DenoiseSettingsPanel(
+    denoiseStrength: Float,
+    onDenoiseStrengthChange: (Float) -> Unit,
+    preset: UltraDetailPreset,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
+        ),
+        modifier = modifier.padding(horizontal = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            // Header
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "🔇 Noise Reduction",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    text = "${(denoiseStrength * 100).toInt()}%",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            
+            // Description
+            Text(
+                text = "Controls how aggressively noise is reduced from combined frames",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+            )
+            
+            // Slider with labels
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "Subtle",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                Slider(
+                    value = denoiseStrength,
+                    onValueChange = onDenoiseStrengthChange,
+                    valueRange = 0f..1f,
+                    steps = 9,  // 0%, 10%, 20%, ... 100%
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 8.dp)
+                )
+                
+                Text(
+                    text = "Strong",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            
+            // Hint based on current value
+            Text(
+                text = when {
+                    denoiseStrength < 0.3f -> "💡 Preserves more detail, some noise may remain"
+                    denoiseStrength < 0.6f -> "💡 Balanced - good for most photos"
+                    denoiseStrength < 0.85f -> "💡 Cleaner image, may soften fine details"
+                    else -> "💡 Maximum noise reduction - best for low light"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
+                modifier = Modifier.padding(top = 8.dp)
+            )
+        }
     }
 }
 

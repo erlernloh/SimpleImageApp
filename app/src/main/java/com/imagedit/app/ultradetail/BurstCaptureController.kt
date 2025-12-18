@@ -8,7 +8,10 @@
 package com.imagedit.app.ultradetail
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -21,18 +24,31 @@ import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 
 private const val TAG = "BurstCaptureController"
+
+/**
+ * Capture quality mode for burst capture
+ */
+enum class CaptureQuality {
+    /** Use ImageAnalysis - faster but preview quality frames */
+    PREVIEW,
+    /** Use ImageCapture - slower but full sensor quality frames */
+    HIGH_QUALITY
+}
 
 /**
  * Burst capture configuration
@@ -41,7 +57,8 @@ data class BurstCaptureConfig(
     val frameCount: Int = 8,
     val targetResolution: Size = Size(4000, 3000), // ~12MP
     val lockAeAf: Boolean = true,
-    val frameIntervalMs: Long = 50 // Time between frames
+    val frameIntervalMs: Long = 150, // Time between frames - 150ms allows for hand micro-movements
+    val captureQuality: CaptureQuality = CaptureQuality.PREVIEW // Quality mode for capture
 ) {
     init {
         require(frameCount in 2..16) { "Frame count must be between 2 and 16" }
@@ -127,12 +144,36 @@ data class CapturedFrame(
 }
 
 /**
+ * High-quality captured frame using Bitmap instead of YUV planes.
+ * Used when ImageCapture is available for full-resolution capture.
+ */
+data class HighQualityCapturedFrame(
+    val bitmap: android.graphics.Bitmap,
+    val width: Int,
+    val height: Int,
+    val timestamp: Long,
+    val gyroSamples: List<GyroSample> = emptyList(),
+    val exposureTimeNs: Long = 0,
+    val iso: Int = 0
+) {
+    /**
+     * Recycle the bitmap to free memory
+     */
+    fun recycle() {
+        if (!bitmap.isRecycled) {
+            bitmap.recycle()
+        }
+    }
+}
+
+/**
  * Burst capture state
  */
 sealed class BurstCaptureState {
     object Idle : BurstCaptureState()
     data class Capturing(val framesCollected: Int, val totalFrames: Int) : BurstCaptureState()
     data class Complete(val frames: List<CapturedFrame>) : BurstCaptureState()
+    data class HighQualityComplete(val frames: List<HighQualityCapturedFrame>) : BurstCaptureState()
     data class Error(val message: String) : BurstCaptureState()
 }
 
@@ -144,13 +185,14 @@ sealed class BurstCaptureState {
  */
 class BurstCaptureController(
     private val context: Context,
-    private val config: BurstCaptureConfig = BurstCaptureConfig()
+    val config: BurstCaptureConfig = BurstCaptureConfig()
 ) : SensorEventListener {
     private val _captureState = MutableStateFlow<BurstCaptureState>(BurstCaptureState.Idle)
     val captureState: StateFlow<BurstCaptureState> = _captureState.asStateFlow()
     
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private var imageAnalysis: ImageAnalysis? = null
+    private var imageCapture: ImageCapture? = null  // For high-quality capture
     private var camera: Camera? = null
     
     private val capturedFrames = mutableListOf<CapturedFrame>()
@@ -185,7 +227,7 @@ class BurstCaptureController(
         cameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA,
         preview: Preview? = null
     ) {
-        // Configure image analysis for YUV capture with high resolution
+        // Configure resolution selector for both use cases
         val resolutionSelector = ResolutionSelector.Builder()
             .setResolutionStrategy(
                 ResolutionStrategy(
@@ -196,6 +238,7 @@ class BurstCaptureController(
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
             .build()
         
+        // Always create ImageAnalysis for preview-quality capture (backward compatibility)
         imageAnalysis = ImageAnalysis.Builder()
             .setResolutionSelector(resolutionSelector)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
@@ -207,9 +250,24 @@ class BurstCaptureController(
                 }
             }
         
-        // Bind to lifecycle
-        val useCases = mutableListOf<UseCase>(imageAnalysis!!)
+        // Build use cases list
+        val useCases = mutableListOf<UseCase>()
         preview?.let { useCases.add(it) }
+        
+        // Add ImageCapture for high-quality mode, or ImageAnalysis for preview mode
+        if (config.captureQuality == CaptureQuality.HIGH_QUALITY) {
+            // Create ImageCapture for full-resolution capture
+            imageCapture = ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                .setResolutionSelector(resolutionSelector)
+                .build()
+            useCases.add(imageCapture!!)
+            Log.d(TAG, "High-quality capture mode enabled (ImageCapture)")
+        } else {
+            // Use ImageAnalysis for preview-quality capture
+            useCases.add(imageAnalysis!!)
+            Log.d(TAG, "Preview capture mode enabled (ImageAnalysis)")
+        }
         
         cameraProvider.unbindAll()
         camera = cameraProvider.bindToLifecycle(
@@ -219,8 +277,12 @@ class BurstCaptureController(
         )
         
         // Log actual resolution obtained
-        val actualResolution = imageAnalysis?.resolutionInfo?.resolution ?: config.targetResolution
-        Log.d(TAG, "Burst capture setup complete: ${config.frameCount} frames at $actualResolution (requested: ${config.targetResolution})")
+        val actualResolution = when (config.captureQuality) {
+            CaptureQuality.HIGH_QUALITY -> imageCapture?.resolutionInfo?.resolution ?: config.targetResolution
+            CaptureQuality.PREVIEW -> imageAnalysis?.resolutionInfo?.resolution ?: config.targetResolution
+        }
+        Log.d(TAG, "Burst capture setup complete: ${config.frameCount} frames at $actualResolution " +
+                   "(requested: ${config.targetResolution}, quality: ${config.captureQuality})")
     }
     
     /**
@@ -345,6 +407,207 @@ class BurstCaptureController(
         Log.i(TAG, "Gyro estimated max rotation during burst: %.2f degrees".format(estimatedRotationDeg))
     }
     
+    // ==================== High-Quality Capture (ImageCapture) ====================
+    
+    /**
+     * Start high-quality burst capture using ImageCapture.
+     * This captures full-resolution frames instead of preview-quality frames.
+     * 
+     * @param scope Coroutine scope for capture operation
+     * @return List of high-quality captured frames
+     */
+    suspend fun startHighQualityCapture(scope: CoroutineScope): List<HighQualityCapturedFrame> {
+        if (isCapturing) {
+            Log.w(TAG, "Already capturing, ignoring startHighQualityCapture")
+            return emptyList()
+        }
+        
+        if (imageCapture == null) {
+            Log.e(TAG, "ImageCapture not available - was setup() called with HIGH_QUALITY mode?")
+            _captureState.value = BurstCaptureState.Error("High-quality capture not configured")
+            return emptyList()
+        }
+        
+        isCapturing = true
+        val frames = mutableListOf<HighQualityCapturedFrame>()
+        
+        try {
+            // Request GC before capture to free up memory
+            System.gc()
+            
+            _captureState.value = BurstCaptureState.Capturing(0, config.frameCount)
+            
+            // Start gyroscope recording for motion tracking
+            startGyroRecording()
+            
+            // Lock AE/AF if configured
+            if (config.lockAeAf) {
+                lockExposureAndFocus()
+            }
+            
+            // Capture frames sequentially
+            repeat(config.frameCount) { index ->
+                val frame = captureHighQualityFrame()
+                if (frame != null) {
+                    frames.add(frame)
+                    _captureState.value = BurstCaptureState.Capturing(index + 1, config.frameCount)
+                    Log.d(TAG, "HQ Captured frame ${index + 1}/${config.frameCount}: ${frame.width}x${frame.height}")
+                } else {
+                    Log.w(TAG, "Failed to capture HQ frame ${index + 1}")
+                }
+                
+                // Delay between frames for hand movement variation
+                if (index < config.frameCount - 1) {
+                    delay(config.frameIntervalMs)
+                }
+            }
+            
+            // Stop gyroscope recording
+            stopGyroRecording()
+            
+            // Log gyro statistics
+            logGyroStatisticsHQ(frames)
+            
+            // Unlock AE/AF
+            if (config.lockAeAf) {
+                unlockExposureAndFocus()
+            }
+            
+            isCapturing = false
+            
+            if (frames.isEmpty()) {
+                _captureState.value = BurstCaptureState.Error("No frames captured")
+                return emptyList()
+            }
+            
+            _captureState.value = BurstCaptureState.HighQualityComplete(frames)
+            Log.i(TAG, "High-quality burst complete: ${frames.size} frames")
+            return frames
+            
+        } catch (e: CancellationException) {
+            Log.d(TAG, "High-quality capture cancelled")
+            frames.forEach { it.recycle() }
+            stopGyroRecording()
+            isCapturing = false
+            _captureState.value = BurstCaptureState.Idle
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "High-quality burst capture failed", e)
+            frames.forEach { it.recycle() }
+            stopGyroRecording()
+            isCapturing = false
+            _captureState.value = BurstCaptureState.Error(e.message ?: "Unknown error")
+            return emptyList()
+        }
+    }
+    
+    /**
+     * Capture a single high-quality frame using ImageCapture
+     */
+    private suspend fun captureHighQualityFrame(): HighQualityCapturedFrame? {
+        val capture = imageCapture ?: return null
+        
+        return suspendCancellableCoroutine { continuation ->
+            // Use elapsedRealtimeNanos which matches sensor event timestamps (both use CLOCK_BOOTTIME)
+            val timestamp = android.os.SystemClock.elapsedRealtimeNanos()
+            
+            capture.takePicture(
+                ContextCompat.getMainExecutor(context),
+                object : ImageCapture.OnImageCapturedCallback() {
+                    override fun onCaptureSuccess(image: ImageProxy) {
+                        try {
+                            val bitmap = imageProxyToBitmap(image)
+                            if (bitmap != null) {
+                                val gyroSamples = getGyroSamplesForFrame(timestamp)
+                                val frame = HighQualityCapturedFrame(
+                                    bitmap = bitmap,
+                                    width = bitmap.width,
+                                    height = bitmap.height,
+                                    timestamp = timestamp,
+                                    gyroSamples = gyroSamples
+                                )
+                                continuation.resume(frame)
+                            } else {
+                                Log.e(TAG, "Failed to convert ImageProxy to Bitmap")
+                                continuation.resume(null)
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error processing captured image", e)
+                            continuation.resume(null)
+                        } finally {
+                            image.close()
+                        }
+                    }
+                    
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e(TAG, "ImageCapture failed: ${exception.imageCaptureError}", exception)
+                        continuation.resume(null)
+                    }
+                }
+            )
+        }
+    }
+    
+    /**
+     * Convert ImageProxy to Bitmap
+     */
+    private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
+        return try {
+            val buffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            
+            // Decode JPEG to Bitmap with ARGB_8888 format for consistent native processing
+            val options = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+            
+            // Apply rotation if needed
+            val rotationDegrees = image.imageInfo.rotationDegrees
+            if (rotationDegrees != 0 && bitmap != null) {
+                val matrix = Matrix().apply {
+                    postRotate(rotationDegrees.toFloat())
+                }
+                val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                if (rotated !== bitmap) {
+                    bitmap.recycle()
+                }
+                rotated
+            } else {
+                bitmap
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to convert ImageProxy to Bitmap", e)
+            null
+        }
+    }
+    
+    /**
+     * Log gyroscope statistics for high-quality frames
+     */
+    private fun logGyroStatisticsHQ(frames: List<HighQualityCapturedFrame>) {
+        val totalSamples = frames.sumOf { it.gyroSamples.size }
+        val avgSamplesPerFrame = if (frames.isNotEmpty()) totalSamples / frames.size else 0
+        
+        if (totalSamples == 0) {
+            Log.w(TAG, "HQ Gyro stats: No gyro samples collected")
+            return
+        }
+        
+        var maxRotation = 0f
+        frames.flatMap { it.gyroSamples }.forEach { sample ->
+            val magnitude = kotlin.math.sqrt(
+                sample.rotationX * sample.rotationX +
+                sample.rotationY * sample.rotationY +
+                sample.rotationZ * sample.rotationZ
+            )
+            maxRotation = kotlin.math.max(maxRotation, magnitude)
+        }
+        
+        Log.i(TAG, "HQ Gyro stats: $totalSamples samples (~$avgSamplesPerFrame/frame), max rotation: %.4f rad/s".format(maxRotation))
+    }
+    
     /**
      * Cancel ongoing capture
      */
@@ -373,25 +636,31 @@ class BurstCaptureController(
     
     /**
      * Lock auto-exposure and auto-focus
+     * 
+     * For burst capture, we need consistent exposure across all frames.
+     * This locks both focus and exposure metering to prevent changes during capture.
      */
     private suspend fun lockExposureAndFocus() {
         camera?.cameraControl?.let { control ->
             try {
-                // Start focus and metering
+                // Start focus and metering at center point
                 val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
                 val centerPoint = factory.createPoint(0.5f, 0.5f)
-                val action = FocusMeteringAction.Builder(centerPoint)
-                    .setAutoCancelDuration(5, java.util.concurrent.TimeUnit.SECONDS)
+                
+                // Build action that locks both AE and AF
+                // FLAG_AE locks auto-exposure, FLAG_AF locks auto-focus
+                val action = FocusMeteringAction.Builder(centerPoint, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                    .setAutoCancelDuration(10, java.util.concurrent.TimeUnit.SECONDS) // Longer duration for burst
                     .build()
                 
-                control.startFocusAndMetering(action).await()
+                val result = control.startFocusAndMetering(action).await()
                 
-                // Lock exposure
-                control.setExposureCompensationIndex(0).await()
+                // Wait a bit for exposure to stabilize after lock
+                delay(100)
                 
-                Log.d(TAG, "AE/AF locked")
+                Log.d(TAG, "AE/AF locked: focused=${result.isFocusSuccessful}")
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to lock AE/AF", e)
+                Log.w(TAG, "Failed to lock AE/AF: ${e.message}")
             }
         }
     }

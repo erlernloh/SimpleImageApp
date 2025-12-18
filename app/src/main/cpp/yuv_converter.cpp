@@ -9,15 +9,18 @@
 
 namespace ultradetail {
 
-// BT.601 YUV to RGB conversion coefficients
-// R = Y + 1.402 * (V - 128)
-// G = Y - 0.344 * (U - 128) - 0.714 * (V - 128)
-// B = Y + 1.772 * (U - 128)
+// BT.601 LIMITED-RANGE YUV to RGB conversion coefficients
+// Android cameras output limited-range YUV (Y: 16-235, UV: 16-240)
+// R = 1.164 * (Y - 16) + 1.596 * (V - 128)
+// G = 1.164 * (Y - 16) - 0.813 * (V - 128) - 0.391 * (U - 128)
+// B = 1.164 * (Y - 16) + 2.018 * (U - 128)
 
-constexpr float YUV_R_V = 1.402f;
-constexpr float YUV_G_U = -0.344f;
-constexpr float YUV_G_V = -0.714f;
-constexpr float YUV_B_U = 1.772f;
+constexpr float YUV_Y_SCALE = 1.164f;  // 255/219 for limited range
+constexpr float YUV_Y_OFFSET = 16.0f;  // Y offset for limited range
+constexpr float YUV_R_V = 1.596f;
+constexpr float YUV_G_U = -0.391f;
+constexpr float YUV_G_V = -0.813f;
+constexpr float YUV_B_U = 2.018f;
 
 void yuvToRgbFloat(const YUVFrame& yuv, RGBImage& output) {
     if (output.width != yuv.width || output.height != yuv.height) {
@@ -28,8 +31,10 @@ void yuvToRgbFloat(const YUVFrame& yuv, RGBImage& output) {
     const int height = yuv.height;
     
 #ifdef USE_NEON
-    // NEON-optimized conversion
+    // NEON-optimized conversion with limited-range BT.601
+    const float32x4_t v_16 = vdupq_n_f32(16.0f);
     const float32x4_t v_128 = vdupq_n_f32(128.0f);
+    const float32x4_t v_y_scale = vdupq_n_f32(YUV_Y_SCALE);
     const float32x4_t v_r_v = vdupq_n_f32(YUV_R_V);
     const float32x4_t v_g_u = vdupq_n_f32(YUV_G_U);
     const float32x4_t v_g_v = vdupq_n_f32(YUV_G_V);
@@ -82,11 +87,13 @@ void yuvToRgbFloat(const YUVFrame& yuv, RGBImage& output) {
             float32x4_t vU = vld1q_f32(uVals);
             float32x4_t vV = vld1q_f32(vVals);
             
-            // Subtract 128 from UV
+            // Apply limited-range offset: Y - 16, UV - 128
+            vY = vsubq_f32(vY, v_16);
+            vY = vmulq_f32(vY, v_y_scale);  // Scale Y by 1.164
             vU = vsubq_f32(vU, v_128);
             vV = vsubq_f32(vV, v_128);
             
-            // Compute RGB
+            // Compute RGB using BT.601 limited-range coefficients
             float32x4_t vR = vmlaq_f32(vY, vV, v_r_v);
             float32x4_t vG = vmlaq_f32(vmlaq_f32(vY, vU, v_g_u), vV, v_g_v);
             float32x4_t vB = vmlaq_f32(vY, vU, v_b_u);
@@ -111,9 +118,9 @@ void yuvToRgbFloat(const YUVFrame& yuv, RGBImage& output) {
             }
         }
         
-        // Handle remaining pixels
+        // Handle remaining pixels with limited-range conversion
         for (; x < width; ++x) {
-            float yVal = static_cast<float>(yRow[x]);
+            float yVal = (static_cast<float>(yRow[x]) - YUV_Y_OFFSET) * YUV_Y_SCALE;
             int uvIdx = (x / 2) * yuv.uvPixelStride;
             float uVal = static_cast<float>(uRow[uvIdx]) - 128.0f;
             float vVal = static_cast<float>(vRow[uvIdx]) - 128.0f;
@@ -130,7 +137,7 @@ void yuvToRgbFloat(const YUVFrame& yuv, RGBImage& output) {
         }
     }
 #else
-    // Scalar fallback
+    // Scalar fallback with limited-range BT.601 conversion
     for (int y = 0; y < height; ++y) {
         const uint8_t* yRow = yuv.yPlane + y * yuv.yRowStride;
         const uint8_t* uRow = yuv.uPlane + (y / 2) * yuv.uvRowStride;
@@ -138,7 +145,8 @@ void yuvToRgbFloat(const YUVFrame& yuv, RGBImage& output) {
         RGBPixel* outRow = output.row(y);
         
         for (int x = 0; x < width; ++x) {
-            float yVal = static_cast<float>(yRow[x]);
+            // Apply limited-range offset and scale
+            float yVal = (static_cast<float>(yRow[x]) - YUV_Y_OFFSET) * YUV_Y_SCALE;
             int uvIdx = (x / 2) * yuv.uvPixelStride;
             float uVal = static_cast<float>(uRow[uvIdx]) - 128.0f;
             float vVal = static_cast<float>(vRow[uvIdx]) - 128.0f;
@@ -166,7 +174,11 @@ void yuvToGray(const YUVFrame& yuv, GrayImage& output) {
     const int height = yuv.height;
     
 #ifdef USE_NEON
-    const float32x4_t v_255_inv = vdupq_n_f32(1.0f / 255.0f);
+    // Limited-range conversion: (Y - 16) * 1.164 / 255
+    const float32x4_t v_16 = vdupq_n_f32(16.0f);
+    const float32x4_t v_scale = vdupq_n_f32(YUV_Y_SCALE / 255.0f);  // 1.164 / 255
+    const float32x4_t v_zero = vdupq_n_f32(0.0f);
+    const float32x4_t v_one = vdupq_n_f32(1.0f);
     
     for (int y = 0; y < height; ++y) {
         const uint8_t* yRow = yuv.yPlane + y * yuv.yRowStride;
@@ -177,24 +189,34 @@ void yuvToGray(const YUVFrame& yuv, GrayImage& output) {
             float32x4_t v0 = neon::load_u8_to_f32_low(yRow + x);
             float32x4_t v1 = neon::load_u8_to_f32_high(yRow + x);
             
-            v0 = vmulq_f32(v0, v_255_inv);
-            v1 = vmulq_f32(v1, v_255_inv);
+            // Apply limited-range offset and scale
+            v0 = vsubq_f32(v0, v_16);
+            v1 = vsubq_f32(v1, v_16);
+            v0 = vmulq_f32(v0, v_scale);
+            v1 = vmulq_f32(v1, v_scale);
+            
+            // Clamp to [0, 1]
+            v0 = vmaxq_f32(vminq_f32(v0, v_one), v_zero);
+            v1 = vmaxq_f32(vminq_f32(v1, v_one), v_zero);
             
             vst1q_f32(outRow + x, v0);
             vst1q_f32(outRow + x + 4, v1);
         }
         
         for (; x < width; ++x) {
-            outRow[x] = static_cast<float>(yRow[x]) / 255.0f;
+            float val = (static_cast<float>(yRow[x]) - YUV_Y_OFFSET) * YUV_Y_SCALE / 255.0f;
+            outRow[x] = clamp(val, 0.0f, 1.0f);
         }
     }
 #else
+    // Scalar fallback with limited-range conversion
     for (int y = 0; y < height; ++y) {
         const uint8_t* yRow = yuv.yPlane + y * yuv.yRowStride;
         float* outRow = output.row(y);
         
         for (int x = 0; x < width; ++x) {
-            outRow[x] = static_cast<float>(yRow[x]) / 255.0f;
+            float val = (static_cast<float>(yRow[x]) - YUV_Y_OFFSET) * YUV_Y_SCALE / 255.0f;
+            outRow[x] = clamp(val, 0.0f, 1.0f);
         }
     }
 #endif

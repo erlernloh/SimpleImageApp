@@ -25,7 +25,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.FilterList
@@ -130,7 +130,7 @@ fun GalleryScreen(
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(
-                            Icons.Default.ArrowBack,
+                            Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
                             tint = MaterialTheme.colorScheme.onSurface
                         )
@@ -188,7 +188,29 @@ fun GalleryScreen(
                                     text = { Text("Share") },
                                     onClick = {
                                         viewModel.shareSelectedPhotos { uris ->
-                                            // Share intent will be handled here
+                                            if (uris.isNotEmpty()) {
+                                                val shareIntent = if (uris.size == 1) {
+                                                    // Single image share
+                                                    Intent(Intent.ACTION_SEND).apply {
+                                                        type = "image/*"
+                                                        putExtra(Intent.EXTRA_STREAM, Uri.parse(uris.first()))
+                                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                    }
+                                                } else {
+                                                    // Multiple images share
+                                                    Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                                                        type = "image/*"
+                                                        putParcelableArrayListExtra(
+                                                            Intent.EXTRA_STREAM,
+                                                            ArrayList(uris.map { Uri.parse(it) })
+                                                        )
+                                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                    }
+                                                }
+                                                context.startActivity(
+                                                    Intent.createChooser(shareIntent, "Share ${uris.size} photo(s)")
+                                                )
+                                            }
                                         }
                                         showBulkMenu = false
                                     },

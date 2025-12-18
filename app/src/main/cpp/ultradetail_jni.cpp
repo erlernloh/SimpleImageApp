@@ -452,11 +452,11 @@ Java_com_imagedit_app_ultradetail_NativeBurstProcessor_nativeComputeEdgeMask(
         float* lumRow = luminance.row(y);
         
         for (int x = 0; x < width; ++x) {
-            // ARGB format
+            // Android ARGB_8888 format: R, G, B, A (in memory order)
             int idx = x * 4;
-            float r = row[idx + 1] / 255.0f;
-            float g = row[idx + 2] / 255.0f;
-            float b = row[idx + 3] / 255.0f;
+            float r = row[idx + 0] / 255.0f;
+            float g = row[idx + 1] / 255.0f;
+            float b = row[idx + 2] / 255.0f;
             lumRow[x] = 0.299f * r + 0.587f * g + 0.114f * b;
         }
     }
@@ -583,10 +583,18 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessBitmaps(
         return -3;
     }
     
+    // Verify bitmap format
+    if (bitmapInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        LOGE("Input bitmap format is %d, expected RGBA_8888 (%d)", 
+             bitmapInfo.format, ANDROID_BITMAP_FORMAT_RGBA_8888);
+        return -3;
+    }
+    
     int width = bitmapInfo.width;
     int height = bitmapInfo.height;
     
-    LOGI("Processing %d frames (%dx%d) through MFSR pipeline", numFrames, width, height);
+    LOGI("Processing %d frames (%dx%d, format=%d, stride=%d) through MFSR pipeline", 
+         numFrames, width, height, bitmapInfo.format, bitmapInfo.stride);
     
     // Convert bitmaps to RGBImage format
     std::vector<RGBImage> frames(numFrames);
@@ -605,17 +613,42 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessBitmaps(
         grayFrames[i].resize(width, height);
         
         uint8_t* src = static_cast<uint8_t*>(pixels);
+        
+        // Debug: log first pixel of first frame
+        if (i == 0) {
+            uint8_t* firstRow = src;
+            LOGI("Frame 0 first pixel bytes: [%d, %d, %d, %d]", 
+                 firstRow[0], firstRow[1], firstRow[2], firstRow[3]);
+        }
+        
         for (int y = 0; y < height; ++y) {
             uint8_t* row = src + y * bitmapInfo.stride;
             for (int x = 0; x < width; ++x) {
                 int idx = x * 4;
-                float r = row[idx + 1] / 255.0f;
-                float g = row[idx + 2] / 255.0f;
-                float b = row[idx + 3] / 255.0f;
+                // Android ARGB_8888 format: R, G, B, A (in memory order)
+                float r = row[idx + 0] / 255.0f;
+                float g = row[idx + 1] / 255.0f;
+                float b = row[idx + 2] / 255.0f;
                 
                 frames[i].at(x, y) = RGBPixel(r, g, b);
                 grayFrames[i].at(x, y) = 0.299f * r + 0.587f * g + 0.114f * b;
             }
+        }
+        
+        // Debug: log average pixel value of first frame
+        if (i == 0) {
+            float avgR = 0, avgG = 0, avgB = 0;
+            for (int y = 0; y < height; y += 10) {
+                for (int x = 0; x < width; x += 10) {
+                    const RGBPixel& p = frames[i].at(x, y);
+                    avgR += p.r;
+                    avgG += p.g;
+                    avgB += p.b;
+                }
+            }
+            int samples = (height / 10) * (width / 10);
+            LOGI("Frame 0 avg RGB (sampled): %.3f, %.3f, %.3f", 
+                 avgR / samples, avgG / samples, avgB / samples);
         }
         
         AndroidBitmap_unlockPixels(env, bitmap);
@@ -690,6 +723,22 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessBitmaps(
     }
     
     uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    
+    // Debug: compute output average before writing
+    float outAvgR = 0, outAvgG = 0, outAvgB = 0;
+    int outSamples = 0;
+    for (int y = 0; y < result.outputHeight; y += 20) {
+        for (int x = 0; x < result.outputWidth; x += 20) {
+            const RGBPixel& p = result.outputImage.at(x, y);
+            outAvgR += p.r;
+            outAvgG += p.g;
+            outAvgB += p.b;
+            outSamples++;
+        }
+    }
+    LOGI("Output avg RGB before write: %.3f, %.3f, %.3f", 
+         outAvgR / outSamples, outAvgG / outSamples, outAvgB / outSamples);
+    
     for (int y = 0; y < result.outputHeight; ++y) {
         uint8_t* row = dst + y * outInfo.stride;
         for (int x = 0; x < result.outputWidth; ++x) {
@@ -710,6 +759,241 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessBitmaps(
          result.outputWidth, result.outputHeight,
          result.tilesProcessed, result.processingTimeMs / 1000.0f,
          result.usedFallback ? "yes" : "no");
+    
+    return 0;
+}
+
+/**
+ * Process bitmaps with quality mask for pixel weighting
+ * 
+ * The quality mask provides per-pixel weights (0-1) computed from RGB overlay alignment.
+ * Pixels with higher quality values are given more weight during MFSR accumulation.
+ * 
+ * @param handle Pipeline handle
+ * @param inputBitmaps Array of input Bitmap objects
+ * @param referenceIndex Index of reference frame
+ * @param homographies Flattened 3x3 homography matrices (9 floats per frame), or null
+ * @param qualityMask Per-pixel quality weights (0-1), same size as input frames
+ * @param maskWidth Width of quality mask
+ * @param maskHeight Height of quality mask
+ * @param outputBitmap Pre-allocated output bitmap (scaled size)
+ * @param callback Progress callback object
+ * @return Result code (0 = success)
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeProcessBitmapsWithMask(
+    JNIEnv* env,
+    jobject thiz,
+    jlong handle,
+    jobjectArray inputBitmaps,
+    jint referenceIndex,
+    jfloatArray homographies,
+    jfloatArray qualityMask,
+    jint maskWidth,
+    jint maskHeight,
+    jobject outputBitmap,
+    jobject callback
+) {
+    auto* pipeline = reinterpret_cast<TiledMFSRPipeline*>(handle);
+    if (!pipeline) {
+        LOGE("Invalid pipeline handle");
+        return -1;
+    }
+    
+    int numFrames = env->GetArrayLength(inputBitmaps);
+    if (numFrames < 2) {
+        LOGE("Need at least 2 frames for MFSR");
+        return -2;
+    }
+    
+    // Get quality mask data
+    jfloat* maskData = nullptr;
+    int maskLen = 0;
+    if (qualityMask != nullptr) {
+        maskLen = env->GetArrayLength(qualityMask);
+        maskData = env->GetFloatArrayElements(qualityMask, nullptr);
+        LOGI("Quality mask received: %dx%d (%d pixels), expected %d", 
+             maskWidth, maskHeight, maskLen, maskWidth * maskHeight);
+    }
+    
+    // Get first bitmap info
+    jobject firstBitmap = env->GetObjectArrayElement(inputBitmaps, 0);
+    AndroidBitmapInfo bitmapInfo;
+    if (AndroidBitmap_getInfo(env, firstBitmap, &bitmapInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to get bitmap info");
+        if (maskData) env->ReleaseFloatArrayElements(qualityMask, maskData, JNI_ABORT);
+        return -3;
+    }
+    
+    // Verify bitmap format
+    if (bitmapInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        LOGE("Input bitmap format is %d, expected RGBA_8888 (%d)", 
+             bitmapInfo.format, ANDROID_BITMAP_FORMAT_RGBA_8888);
+        if (maskData) env->ReleaseFloatArrayElements(qualityMask, maskData, JNI_ABORT);
+        return -3;
+    }
+    
+    int width = bitmapInfo.width;
+    int height = bitmapInfo.height;
+    
+    LOGI("Processing %d frames (%dx%d) with quality mask through MFSR pipeline", 
+         numFrames, width, height);
+    
+    // Log quality mask statistics
+    if (maskData && maskLen > 0) {
+        float maskMin = maskData[0], maskMax = maskData[0], maskSum = 0;
+        for (int i = 0; i < maskLen; ++i) {
+            if (maskData[i] < maskMin) maskMin = maskData[i];
+            if (maskData[i] > maskMax) maskMax = maskData[i];
+            maskSum += maskData[i];
+        }
+        LOGI("Quality mask stats: min=%.3f, max=%.3f, avg=%.3f", 
+             maskMin, maskMax, maskSum / maskLen);
+    }
+    
+    // Convert bitmaps to RGBImage format
+    std::vector<RGBImage> frames(numFrames);
+    std::vector<GrayImage> grayFrames(numFrames);
+    
+    for (int i = 0; i < numFrames; ++i) {
+        jobject bitmap = env->GetObjectArrayElement(inputBitmaps, i);
+        
+        void* pixels;
+        if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+            LOGE("Failed to lock bitmap %d", i);
+            if (maskData) env->ReleaseFloatArrayElements(qualityMask, maskData, JNI_ABORT);
+            return -4;
+        }
+        
+        frames[i].resize(width, height);
+        grayFrames[i].resize(width, height);
+        
+        uint8_t* src = static_cast<uint8_t*>(pixels);
+        
+        for (int y = 0; y < height; ++y) {
+            uint8_t* row = src + y * bitmapInfo.stride;
+            for (int x = 0; x < width; ++x) {
+                int idx = x * 4;
+                // Android ARGB_8888 format: R, G, B, A (in memory order)
+                float r = row[idx + 0] / 255.0f;
+                float g = row[idx + 1] / 255.0f;
+                float b = row[idx + 2] / 255.0f;
+                
+                // Apply quality mask weighting if available
+                // This pre-weights pixels based on alignment quality
+                float weight = 1.0f;
+                if (maskData && maskLen == width * height) {
+                    weight = maskData[y * width + x];
+                    // Blend between original and weighted: high quality = full color, low = attenuated
+                    // This helps the MFSR accumulator give less weight to misaligned regions
+                    float blendFactor = 0.3f + 0.7f * weight;  // Range: 0.3 to 1.0
+                    r *= blendFactor;
+                    g *= blendFactor;
+                    b *= blendFactor;
+                }
+                
+                frames[i].at(x, y) = RGBPixel(r, g, b);
+                grayFrames[i].at(x, y) = 0.299f * r + 0.587f * g + 0.114f * b;
+            }
+        }
+        
+        AndroidBitmap_unlockPixels(env, bitmap);
+    }
+    
+    // Release quality mask
+    if (maskData) {
+        env->ReleaseFloatArrayElements(qualityMask, maskData, JNI_ABORT);
+    }
+    
+    // Parse homographies if provided
+    std::vector<GyroHomography> gyroHomographies;
+    if (homographies != nullptr) {
+        int homLen = env->GetArrayLength(homographies);
+        if (homLen >= numFrames * 9) {
+            jfloat* homData = env->GetFloatArrayElements(homographies, nullptr);
+            
+            for (int i = 0; i < numFrames; ++i) {
+                GyroHomography gh;
+                for (int j = 0; j < 9; ++j) {
+                    gh.h[j] = homData[i * 9 + j];
+                }
+                gh.isValid = true;
+                gyroHomographies.push_back(gh);
+            }
+            
+            env->ReleaseFloatArrayElements(homographies, homData, JNI_ABORT);
+        }
+    }
+    
+    // Setup progress callback
+    jmethodID progressMethod = nullptr;
+    if (callback != nullptr) {
+        jclass callbackClass = env->GetObjectClass(callback);
+        progressMethod = env->GetMethodID(callbackClass, "onProgress", 
+                                          "(IILjava/lang/String;F)V");
+    }
+    
+    // Process
+    PipelineResult result;
+    pipeline->process(
+        frames, grayFrames, referenceIndex,
+        gyroHomographies.empty() ? nullptr : &gyroHomographies,
+        result,
+        [&](int tile, int total, const char* msg, float progress) {
+            if (callback && progressMethod) {
+                jstring jMsg = env->NewStringUTF(msg);
+                env->CallVoidMethod(callback, progressMethod, tile, total, jMsg, progress);
+                env->DeleteLocalRef(jMsg);
+            }
+        }
+    );
+    
+    if (!result.success) {
+        LOGE("MFSR processing with quality mask failed");
+        return -5;
+    }
+    
+    // Copy result to output bitmap
+    AndroidBitmapInfo outInfo;
+    if (AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to get output bitmap info");
+        return -6;
+    }
+    
+    if (outInfo.width != static_cast<uint32_t>(result.outputWidth) ||
+        outInfo.height != static_cast<uint32_t>(result.outputHeight)) {
+        LOGE("Output bitmap size mismatch: expected %dx%d, got %dx%d",
+             result.outputWidth, result.outputHeight, outInfo.width, outInfo.height);
+        return -7;
+    }
+    
+    void* outPixels;
+    if (AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("Failed to lock output bitmap");
+        return -8;
+    }
+    
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    
+    for (int y = 0; y < result.outputHeight; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < result.outputWidth; ++x) {
+            const RGBPixel& p = result.outputImage.at(x, y);
+            int idx = x * 4;
+            // Android ARGB_8888 format: R, G, B, A (in memory order)
+            row[idx + 0] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;  // Alpha
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("MFSR with quality mask complete: %dx%d -> %dx%d, tiles=%d, time=%.1fs",
+         result.inputWidth, result.inputHeight,
+         result.outputWidth, result.outputHeight,
+         result.tilesProcessed, result.processingTimeMs / 1000.0f);
     
     return 0;
 }

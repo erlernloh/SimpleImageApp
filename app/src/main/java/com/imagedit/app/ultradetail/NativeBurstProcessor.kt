@@ -243,14 +243,37 @@ class NativeBurstProcessor private constructor(
     ): Int
     
     companion object {
+        private var libraryLoaded = false
+        private var libraryLoadError: String? = null
+        
         init {
-            System.loadLibrary("ultradetail")
+            try {
+                System.loadLibrary("ultradetail")
+                libraryLoaded = true
+            } catch (e: UnsatisfiedLinkError) {
+                libraryLoadError = "Native library not available for this device architecture: ${e.message}"
+                android.util.Log.e("NativeBurstProcessor", libraryLoadError!!)
+            }
         }
         
         /**
+         * Check if native library is available
+         */
+        fun isAvailable(): Boolean = libraryLoaded
+        
+        /**
+         * Get library load error message if any
+         */
+        fun getLoadError(): String? = libraryLoadError
+        
+        /**
          * Create a new burst processor with default parameters
+         * @throws IllegalStateException if native library is not available
          */
         fun create(params: BurstProcessorParams = BurstProcessorParams()): NativeBurstProcessor {
+            if (!libraryLoaded) {
+                throw IllegalStateException(libraryLoadError ?: "Native library not loaded")
+            }
             val handle = nativeCreate(
                 params.alignmentTileSize,
                 params.searchRadius,

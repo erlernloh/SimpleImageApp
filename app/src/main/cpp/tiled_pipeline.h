@@ -18,6 +18,7 @@
 
 #include "common.h"
 #include "optical_flow.h"
+#include "phase_correlation.h"
 #include "mfsr.h"
 #include <vector>
 #include <functional>
@@ -44,13 +45,16 @@ struct TilePipelineConfig {
     OpticalFlowParams flowParams;
     
     // Robustness settings
+    // Fix #4: Adaptive robustness - threshold is now dynamically adjusted based on
+    // local flow confidence. High confidence regions use gentler rejection,
+    // low confidence regions use more aggressive rejection.
     enum class RobustnessMethod {
         NONE,           // Simple averaging
         HUBER,          // Huber loss (mild outlier rejection)
         TUKEY           // Tukey biweight (aggressive outlier rejection)
     };
-    RobustnessMethod robustness = RobustnessMethod::TUKEY;
-    float robustnessThreshold = 0.2f;  // Color difference threshold (increased for better brightness)
+    RobustnessMethod robustness = RobustnessMethod::HUBER;  // HUBER is gentler than TUKEY for low-diversity frames
+    float robustnessThreshold = 0.8f;  // Base threshold - actual threshold is adaptive: base * (0.5 + 0.5 * flowConfidence)
     
     // Memory limits
     size_t maxMemoryMB = 200;     // Target max memory per tile
@@ -58,6 +62,15 @@ struct TilePipelineConfig {
     // Processing options
     bool useGyroInit = true;      // Use gyro for flow initialization
     bool enableRefinement = true; // Apply neural refinement
+    
+    // Fix #5 & #1: Alignment method selection
+    enum class AlignmentMethod {
+        DENSE_OPTICAL_FLOW,     // Original Lucas-Kanade (slower, more accurate for local deformations)
+        PHASE_CORRELATION,      // FFT-based global shift (faster, more robust for translations)
+        HYBRID                  // Gyro + Phase correlation + optional sparse flow (recommended)
+    };
+    AlignmentMethod alignmentMethod = AlignmentMethod::HYBRID;  // Default to hybrid for best quality/speed
+    bool useLocalRefinement = true;   // Use tile-based phase correlation for local refinement
     
     TilePipelineConfig() {
         mfsrParams.scaleFactor = scaleFactor;
@@ -229,8 +242,11 @@ public:
 private:
     TilePipelineConfig config_;
     
-    // Optical flow processor (reused across tiles)
+    // Optical flow processor (reused across tiles) - used when alignmentMethod == DENSE_OPTICAL_FLOW
     std::unique_ptr<DenseOpticalFlow> flowProcessor_;
+    
+    // Hybrid aligner (Fix #5 & #1) - used when alignmentMethod == HYBRID or PHASE_CORRELATION
+    std::unique_ptr<HybridAligner> hybridAligner_;
     
     // MFSR processor (reused across tiles)
     std::unique_ptr<MultiFrameSR> mfsrProcessor_;

@@ -70,6 +70,8 @@ class BatchEditorViewModel @Inject constructor(
     companion object {
         private const val TAG = "BatchEditorViewModel"
         private const val PREVIEW_SIZE = 800 // Smaller preview for batch editing
+        private const val MAX_FULL_RES_SIZE = 4096 // Cap full resolution to prevent OOM
+        private const val MAX_BATCH_SIZE = 20 // Maximum photos in a batch to prevent memory issues
     }
     
     private val _uiState = MutableStateFlow(BatchEditorUiState())
@@ -89,7 +91,15 @@ class BatchEditorViewModel @Inject constructor(
             try {
                 _uiState.value = _uiState.value.copy(isLoading = true, error = null)
                 
-                val batchPhotos = photoUris.map { uriString ->
+                // Limit batch size to prevent memory issues
+                val limitedUris = if (photoUris.size > MAX_BATCH_SIZE) {
+                    Log.w(TAG, "Batch size ${photoUris.size} exceeds limit $MAX_BATCH_SIZE, truncating")
+                    photoUris.take(MAX_BATCH_SIZE)
+                } else {
+                    photoUris
+                }
+                
+                val batchPhotos = limitedUris.map { uriString ->
                     BatchPhoto(uri = Uri.parse(uriString), isLoading = true)
                 }
                 
@@ -399,13 +409,16 @@ class BatchEditorViewModel @Inject constructor(
                 
                 photos.forEachIndexed { index, photo ->
                     try {
-                        // Load full resolution
+                        // Load full resolution with safety cap to prevent OOM
                         val fullRes = withContext(Dispatchers.IO) {
+                            // Request GC before loading large image
+                            System.gc()
+                            
                             ImageUtils.loadBitmap(
                                 context,
                                 photo.uri,
-                                maxWidth = Int.MAX_VALUE,
-                                maxHeight = Int.MAX_VALUE
+                                maxWidth = MAX_FULL_RES_SIZE,
+                                maxHeight = MAX_FULL_RES_SIZE
                             )
                         }
                         

@@ -82,9 +82,9 @@ class PhotoRepositoryImpl @Inject constructor(
     
     override fun getFavoritePhotos(): Flow<List<Photo>> = _favoritePhotos.asStateFlow()
     
-    fun getLoadingState(): Flow<Boolean> = _isLoading.asStateFlow()
+    override fun getLoadingState(): Flow<Boolean> = _isLoading.asStateFlow()
     
-    fun hasMorePages(): Flow<Boolean> = _hasMorePages.asStateFlow()
+    override fun hasMorePages(): Flow<Boolean> = _hasMorePages.asStateFlow()
     
     override suspend fun getPhotoById(id: String): Photo? {
         return _photos.value.find { it.id == id }
@@ -213,7 +213,7 @@ class PhotoRepositoryImpl @Inject constructor(
         }
     }
     
-    suspend fun loadNextPage() {
+    override suspend fun loadNextPage() {
         if (_isLoading.value || !_hasMorePages.value) return
         
         repositoryScope.launch {
@@ -335,7 +335,7 @@ class PhotoRepositoryImpl @Inject constructor(
         }
     }
     
-    fun refreshPhotos() {
+    override fun refreshPhotos() {
         repositoryScope.launch {
             currentOffset = 0
             _hasMorePages.value = true

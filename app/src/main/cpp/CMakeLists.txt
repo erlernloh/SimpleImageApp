@@ -26,6 +26,7 @@ set(ULTRADETAIL_SOURCES
     pyramid.cpp
     alignment.cpp
     optical_flow.cpp
+    phase_correlation.cpp
     tiled_pipeline.cpp
     merge.cpp
     edge_detection.cpp
@@ -39,6 +40,7 @@ set(ULTRADETAIL_HEADERS
     pyramid.h
     alignment.h
     optical_flow.h
+    phase_correlation.h
     tiled_pipeline.h
     merge.h
     edge_detection.h
