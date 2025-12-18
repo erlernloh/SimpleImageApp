@@ -58,16 +58,117 @@ data class BurstCaptureConfig(
     val targetResolution: Size = Size(4000, 3000), // ~12MP
     val lockAeAf: Boolean = true,
     val frameIntervalMs: Long = 150, // Time between frames - 150ms allows for hand micro-movements
-    val captureQuality: CaptureQuality = CaptureQuality.PREVIEW // Quality mode for capture
+    val captureQuality: CaptureQuality = CaptureQuality.PREVIEW, // Quality mode for capture
+    // Enhanced capture settings for ULTRA preset
+    val minFrameDiversity: Float = 0.3f,      // Minimum sub-pixel shift threshold (pixels)
+    val adaptiveInterval: Boolean = false,     // Adjust timing based on detected motion
+    val intervalRangeMs: IntRange = 30..200,   // Range for adaptive interval
+    val diversityCheckEnabled: Boolean = false // Enable real-time diversity validation
 ) {
     init {
-        require(frameCount in 2..16) { "Frame count must be between 2 and 16" }
+        require(frameCount in 2..20) { "Frame count must be between 2 and 20" }
+        require(minFrameDiversity >= 0f) { "minFrameDiversity must be non-negative" }
+    }
+    
+    companion object {
+        /** Standard config for MAX preset (8 frames, fast) */
+        fun forMaxPreset() = BurstCaptureConfig(
+            frameCount = 8,
+            frameIntervalMs = 150,
+            captureQuality = CaptureQuality.HIGH_QUALITY,
+            adaptiveInterval = false,
+            diversityCheckEnabled = false
+        )
+        
+        /** Enhanced config for ULTRA preset (12+ frames, diversity check) */
+        fun forUltraPreset() = BurstCaptureConfig(
+            frameCount = 12,
+            frameIntervalMs = 100,
+            captureQuality = CaptureQuality.HIGH_QUALITY,
+            minFrameDiversity = 0.3f,
+            adaptiveInterval = true,
+            intervalRangeMs = 30..200,
+            diversityCheckEnabled = true
+        )
     }
 }
 
 /**
- * Captured frame data
+ * Frame diversity metrics - measures how much sub-pixel variation exists between frames
  */
+data class FrameDiversityMetrics(
+    val estimatedSubPixelShift: Float,    // Average estimated sub-pixel shift in pixels
+    val gyroMagnitude: Float,             // Average gyro rotation magnitude (rad/s)
+    val frameSpread: Float,               // Spread of motion across frames (0-1)
+    val isDiversityGood: Boolean,         // Whether diversity meets threshold
+    val recommendation: String            // User-facing recommendation
+) {
+    companion object {
+        fun fromGyroSamples(
+            samples: List<GyroSample>,
+            focalLengthPx: Float = 3000f,  // Approximate focal length in pixels
+            threshold: Float = 0.3f
+        ): FrameDiversityMetrics {
+            if (samples.isEmpty()) {
+                return FrameDiversityMetrics(
+                    estimatedSubPixelShift = 0f,
+                    gyroMagnitude = 0f,
+                    frameSpread = 0f,
+                    isDiversityGood = false,
+                    recommendation = "No motion data available"
+                )
+            }
+            
+            // Calculate average gyro magnitude
+            var sumMagnitude = 0f
+            var maxMagnitude = 0f
+            samples.forEach { sample ->
+                val mag = kotlin.math.sqrt(
+                    sample.rotationX * sample.rotationX +
+                    sample.rotationY * sample.rotationY +
+                    sample.rotationZ * sample.rotationZ
+                )
+                sumMagnitude += mag
+                maxMagnitude = kotlin.math.max(maxMagnitude, mag)
+            }
+            val avgMagnitude = sumMagnitude / samples.size
+            
+            // Estimate sub-pixel shift from gyro rotation
+            // Angular velocity (rad/s) * exposure time (~30ms) * focal length = pixel shift
+            val exposureTimeSec = 0.03f  // Approximate exposure time
+            val estimatedShift = avgMagnitude * exposureTimeSec * focalLengthPx
+            
+            // Calculate frame spread (variance in motion)
+            val variance = samples.map { sample ->
+                val mag = kotlin.math.sqrt(
+                    sample.rotationX * sample.rotationX +
+                    sample.rotationY * sample.rotationY +
+                    sample.rotationZ * sample.rotationZ
+                )
+                (mag - avgMagnitude) * (mag - avgMagnitude)
+            }.average().toFloat()
+            val spread = kotlin.math.sqrt(variance) / (avgMagnitude + 0.001f)
+            
+            val isDiversityGood = estimatedShift >= threshold
+            
+            val recommendation = when {
+                estimatedShift < threshold * 0.3f -> "Hold device more loosely for natural hand tremor"
+                estimatedShift < threshold -> "Slight movement detected - try gentle hand motion"
+                estimatedShift > threshold * 3f -> "Too much motion - try to hold steadier"
+                else -> "Good frame diversity for super-resolution"
+            }
+            
+            return FrameDiversityMetrics(
+                estimatedSubPixelShift = estimatedShift,
+                gyroMagnitude = avgMagnitude,
+                frameSpread = spread.coerceIn(0f, 1f),
+                isDiversityGood = isDiversityGood,
+                recommendation = recommendation
+            )
+        }
+    }
+}
+
 /**
  * Gyroscope sample with timestamp
  */
@@ -445,20 +546,44 @@ class BurstCaptureController(
                 lockExposureAndFocus()
             }
             
-            // Capture frames sequentially
+            // Capture frames sequentially with adaptive timing
+            var currentInterval = config.frameIntervalMs
+            var lowDiversityWarningShown = false
+            
             repeat(config.frameCount) { index ->
                 val frame = captureHighQualityFrame()
                 if (frame != null) {
                     frames.add(frame)
                     _captureState.value = BurstCaptureState.Capturing(index + 1, config.frameCount)
                     Log.d(TAG, "HQ Captured frame ${index + 1}/${config.frameCount}: ${frame.width}x${frame.height}")
+                    
+                    // Check diversity after a few frames (for ULTRA preset)
+                    if (config.diversityCheckEnabled && index >= 2 && !lowDiversityWarningShown) {
+                        val allGyroSamples = frames.flatMap { it.gyroSamples }
+                        val diversity = FrameDiversityMetrics.fromGyroSamples(
+                            allGyroSamples,
+                            threshold = config.minFrameDiversity
+                        )
+                        
+                        if (!diversity.isDiversityGood) {
+                            Log.w(TAG, "Low frame diversity detected: ${diversity.recommendation}")
+                            lowDiversityWarningShown = true
+                            // Could emit a UI event here to prompt user
+                        }
+                        
+                        // Adaptive interval: increase delay if motion is too low
+                        if (config.adaptiveInterval) {
+                            currentInterval = calculateAdaptiveInterval(diversity)
+                            Log.d(TAG, "Adaptive interval: ${currentInterval}ms (shift=${diversity.estimatedSubPixelShift}px)")
+                        }
+                    }
                 } else {
                     Log.w(TAG, "Failed to capture HQ frame ${index + 1}")
                 }
                 
                 // Delay between frames for hand movement variation
                 if (index < config.frameCount - 1) {
-                    delay(config.frameIntervalMs)
+                    delay(currentInterval)
                 }
             }
             
@@ -581,6 +706,47 @@ class BurstCaptureController(
             Log.e(TAG, "Failed to convert ImageProxy to Bitmap", e)
             null
         }
+    }
+    
+    /**
+     * Calculate adaptive interval based on current frame diversity
+     * 
+     * If motion is low, increase interval to allow more hand tremor accumulation.
+     * If motion is high, decrease interval to capture more frames quickly.
+     */
+    private fun calculateAdaptiveInterval(diversity: FrameDiversityMetrics): Long {
+        val minInterval = config.intervalRangeMs.first.toLong()
+        val maxInterval = config.intervalRangeMs.last.toLong()
+        val targetShift = config.minFrameDiversity
+        
+        return when {
+            // Very low motion - use maximum interval to accumulate more tremor
+            diversity.estimatedSubPixelShift < targetShift * 0.3f -> maxInterval
+            // Low motion - increase interval
+            diversity.estimatedSubPixelShift < targetShift -> {
+                val ratio = diversity.estimatedSubPixelShift / targetShift
+                (maxInterval - (maxInterval - minInterval) * ratio).toLong()
+            }
+            // Good motion - use shorter interval
+            diversity.estimatedSubPixelShift < targetShift * 2f -> {
+                val ratio = (diversity.estimatedSubPixelShift - targetShift) / targetShift
+                (config.frameIntervalMs - (config.frameIntervalMs - minInterval) * ratio * 0.5f).toLong()
+            }
+            // High motion - use minimum interval
+            else -> minInterval
+        }.coerceIn(minInterval, maxInterval)
+    }
+    
+    /**
+     * Get final diversity metrics for the captured burst
+     * Call this after capture completes to get quality assessment
+     */
+    fun getDiversityMetrics(frames: List<HighQualityCapturedFrame>): FrameDiversityMetrics {
+        val allGyroSamples = frames.flatMap { it.gyroSamples }
+        return FrameDiversityMetrics.fromGyroSamples(
+            allGyroSamples,
+            threshold = config.minFrameDiversity
+        )
     }
     
     /**

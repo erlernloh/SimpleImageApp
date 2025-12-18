@@ -561,6 +561,11 @@ class UltraDetailPipeline(
     
     /**
      * Full MFSR processing for MAX/ULTRA presets with high-quality frames
+     * 
+     * Enhanced pipeline with Phase 1-3 modules:
+     * - Phase 1: Frequency separation, anisotropic merge
+     * - Phase 2: ORB alignment, Drizzle, Rolling shutter correction
+     * - Phase 3: Kalman fusion, Texture synthesis
      */
     private suspend fun processHQWithMFSR(
         frames: List<HighQualityCapturedFrame>,
@@ -578,23 +583,173 @@ class UltraDetailPipeline(
         val inputMegapixels = (width * height) / 1_000_000f
         val outputMegapixels = (outputWidth * outputHeight) / 1_000_000f
         
+        // Determine if we should use enhanced ULTRA features
+        val useEnhancedPipeline = preset == UltraDetailPreset.ULTRA
+        
         Log.i(TAG, "═══════════════════════════════════════════════════════════")
         Log.i(TAG, "║ HQ MFSR PIPELINE START")
         Log.i(TAG, "║ Input: ${width}x${height} (${"%.2f".format(inputMegapixels)}MP) x ${frames.size} frames")
         Log.i(TAG, "║ Output: ${outputWidth}x${outputHeight} (${"%.2f".format(outputMegapixels)}MP) @ ${scaleFactor}x scale")
         Log.i(TAG, "║ Preset: $preset, Reference frame: $referenceIndex")
+        Log.i(TAG, "║ Enhanced pipeline: $useEnhancedPipeline")
         Log.i(TAG, "═══════════════════════════════════════════════════════════")
         
-        // Stage 1: Compute gyro homographies
+        // Stage 1: Compute gyro homographies + optional ORB refinement (ULTRA)
         val stage1Start = System.currentTimeMillis()
         _state.value = PipelineState.ProcessingBurst(
-            ProcessingStage.ALIGNING_FRAMES, 0.1f, "Computing gyro alignment..."
+            ProcessingStage.ALIGNING_FRAMES, 0.1f, "Computing alignment..."
         )
         
-        val homographies = computeHomographiesFromHQFrames(frames)
+        var homographies = computeHomographiesFromHQFrames(frames)
+        
+        // ULTRA: Refine alignment with ORB feature matching + Kalman fusion
+        if (useEnhancedPipeline && frames.size >= 2) {
+            Log.i(TAG, "║ Stage 1a: ORB feature alignment refinement...")
+            val orbConfig = ORBAlignmentConfig(maxKeypoints = 500, ransacThreshold = 3.0f)
+            val refBitmap = frames[referenceIndex].bitmap
+            
+            // Collect ORB-based flow measurements for Kalman fusion
+            val flowMeasurements = mutableListOf<FlowMeasurementKF>()
+            val gyroMeasurements = mutableListOf<GyroMeasurementKF>()
+            
+            homographies = homographies.mapIndexed { idx, gyroH ->
+                if (idx == referenceIndex) {
+                    gyroH // Reference stays identity
+                } else {
+                    try {
+                        val orbResult = alignWithORB(refBitmap, frames[idx].bitmap, orbConfig)
+                        if (orbResult.success && orbResult.inlierCount > 20) {
+                            // Extract translation from ORB homography for Kalman fusion
+                            flowMeasurements.add(FlowMeasurementKF(
+                                dx = orbResult.homography[2],  // h02 = tx
+                                dy = orbResult.homography[5],  // h12 = ty
+                                confidence = orbResult.inlierCount.toFloat() / orbConfig.maxKeypoints
+                            ))
+                            
+                            // Blend ORB with gyro homography (ORB more accurate for translation)
+                            val blendedH = blendHomographies(gyroH, orbResult.homography, 0.7f)
+                            Log.d(TAG, "║   Frame $idx: ORB refined (${orbResult.inlierCount} inliers)")
+                            blendedH
+                        } else {
+                            // Add zero flow with low confidence
+                            flowMeasurements.add(FlowMeasurementKF(0f, 0f, 0.1f))
+                            Log.d(TAG, "║   Frame $idx: ORB failed, using gyro only")
+                            gyroH
+                        }
+                    } catch (e: Exception) {
+                        flowMeasurements.add(FlowMeasurementKF(0f, 0f, 0f))
+                        Log.w(TAG, "║   Frame $idx: ORB error, using gyro", e)
+                        gyroH
+                    }
+                }
+            }
+            
+            // Stage 1b: Kalman fusion for refined motion estimation
+            if (flowMeasurements.isNotEmpty() && frames.any { it.gyroSamples.isNotEmpty() }) {
+                Log.i(TAG, "║ Stage 1b: Kalman fusion for motion refinement...")
+                
+                // Collect all gyro samples
+                frames.forEachIndexed { idx, frame ->
+                    if (idx != referenceIndex) {
+                        frame.gyroSamples.forEachIndexed { sIdx, sample ->
+                            val dt = if (sIdx > 0) {
+                                (sample.timestamp - frame.gyroSamples[sIdx - 1].timestamp).toFloat() / 1_000_000_000f
+                            } else 0.01f
+                            
+                            gyroMeasurements.add(GyroMeasurementKF(
+                                timestamp = sample.timestamp.toFloat() / 1_000_000_000f,
+                                rotX = sample.rotationX,
+                                rotY = sample.rotationY,
+                                rotZ = sample.rotationZ,
+                                dt = dt
+                            ))
+                        }
+                    }
+                }
+                
+                try {
+                    val fusedMotion = kalmanFusion(
+                        gyroSamples = gyroMeasurements,
+                        flowMeasurements = flowMeasurements,
+                        numFrames = frames.size,
+                        config = KalmanFusionConfig(gyroWeight = 0.6f, flowWeight = 0.4f)
+                    )
+                    
+                    if (fusedMotion.isNotEmpty()) {
+                        Log.d(TAG, "║   Kalman fusion: ${fusedMotion.size} motion estimates")
+                        fusedMotion.forEachIndexed { i, motion ->
+                            Log.d(TAG, "║     Motion $i: (${motion.x}, ${motion.y}) ± ${motion.uncertainty}")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "║   Kalman fusion failed", e)
+                }
+            }
+        }
+        
         val stage1Time = System.currentTimeMillis() - stage1Start
-        Log.i(TAG, "║ Stage 1: Gyro alignment computed in ${stage1Time}ms")
-        Log.i(TAG, "║   - Homographies: ${homographies?.size ?: 0} values (${frames.size} frames x 9 matrix elements)")
+        Log.i(TAG, "║ Stage 1: Alignment computed in ${stage1Time}ms")
+        Log.i(TAG, "║   - Homographies: ${homographies.size} (${frames.size} frames)")
+        
+        // Stage 1.5: Rolling Shutter Correction (ULTRA only)
+        var correctedFrames = frames
+        var stage15Time = 0L
+        
+        if (useEnhancedPipeline && frames.any { it.gyroSamples.isNotEmpty() }) {
+            val stage15Start = System.currentTimeMillis()
+            _state.value = PipelineState.ProcessingBurst(
+                ProcessingStage.ALIGNING_FRAMES, 0.25f, "Correcting rolling shutter..."
+            )
+            
+            Log.i(TAG, "║ Stage 1.5: Rolling shutter correction...")
+            
+            val rsConfig = RollingShutterConfig(
+                readoutTimeMs = 33.0f,  // Typical for mobile sensors
+                focalLengthPx = 3000f
+            )
+            
+            correctedFrames = frames.mapIndexed { idx, frame ->
+                if (frame.gyroSamples.isEmpty()) {
+                    frame // No gyro data, skip correction
+                } else {
+                    try {
+                        val correctedBitmap = Bitmap.createBitmap(
+                            frame.width, frame.height, Bitmap.Config.ARGB_8888
+                        )
+                        
+                        // Convert gyro samples to RS format
+                        val gyroSamplesRS = frame.gyroSamples.map { sample ->
+                            GyroSampleRS(
+                                timestamp = sample.timestamp.toFloat(),
+                                rotX = sample.rotationX,
+                                rotY = sample.rotationY,
+                                rotZ = sample.rotationZ
+                            )
+                        }
+                        
+                        if (correctRollingShutter(frame.bitmap, correctedBitmap, gyroSamplesRS, rsConfig)) {
+                            Log.d(TAG, "║   Frame $idx: RS corrected")
+                            HighQualityCapturedFrame(
+                                bitmap = correctedBitmap,
+                                width = frame.width,
+                                height = frame.height,
+                                timestamp = frame.timestamp,
+                                gyroSamples = frame.gyroSamples
+                            )
+                        } else {
+                            correctedBitmap.recycle()
+                            frame
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "║   Frame $idx: RS correction failed", e)
+                        frame
+                    }
+                }
+            }
+            
+            stage15Time = System.currentTimeMillis() - stage15Start
+            Log.i(TAG, "║ Stage 1.5: Rolling shutter correction completed in ${stage15Time}ms")
+        }
         
         // Stage 2: Compute RGB quality mask for pixel selection
         val stage2Start = System.currentTimeMillis()
@@ -602,7 +757,7 @@ class UltraDetailPipeline(
             ProcessingStage.ALIGNING_FRAMES, 0.4f, "Computing RGB quality mask..."
         )
         
-        val qualityResult = rgbQualityMask.computeFromMultipleFrames(frames.map { it.bitmap })
+        val qualityResult = rgbQualityMask.computeFromMultipleFrames(correctedFrames.map { it.bitmap })
         val stage2Time = System.currentTimeMillis() - stage2Start
         Log.i(TAG, "║ Stage 2: RGB Quality Mask computed in ${stage2Time}ms")
         Log.i(TAG, "║   - Alignment: ${"%.1f".format(qualityResult.alignmentPercentage)}% pixels well-aligned")
@@ -624,8 +779,8 @@ class UltraDetailPipeline(
         Log.i(TAG, "║   - Output bitmap allocated: ${outputWidth}x${outputHeight}")
         Log.i(TAG, "║   - Quality mask: ${qualityResult.width}x${qualityResult.height} passed to native")
         
-        // Use original bitmaps for MFSR processing with quality mask for pixel weighting
-        val bitmapArray = frames.map { it.bitmap }.toTypedArray()
+        // Use corrected bitmaps for MFSR processing with quality mask for pixel weighting
+        val bitmapArray = correctedFrames.map { it.bitmap }.toTypedArray()
         
         val mfsrResult = pipeline.processBitmapsWithQualityMask(
             inputBitmaps = bitmapArray,
@@ -664,27 +819,145 @@ class UltraDetailPipeline(
             )
         }
         
+        // Stage 3.5: Enhanced detail processing (ULTRA only)
+        var enhancedBitmap = outputBitmap
+        var stage35Time = 0L
+        
+        if (useEnhancedPipeline) {
+            val stage35Start = System.currentTimeMillis()
+            _state.value = PipelineState.ProcessingBurst(
+                ProcessingStage.MERGING_FRAMES, 0.8f, "Enhancing details..."
+            )
+            
+            try {
+                // Step 1: Frequency separation with adaptive sharpening
+                Log.i(TAG, "║ Stage 3.5a: Frequency separation...")
+                val freqOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+                val freqConfig = FreqSeparationConfig(
+                    lowPassSigma = 2.0f,
+                    highBoost = 1.3f,
+                    edgeProtection = 0.8f
+                )
+                
+                if (NativeMFSRPipeline.applyFreqSeparation(enhancedBitmap, freqOutput, freqConfig)) {
+                    if (enhancedBitmap !== outputBitmap) enhancedBitmap.recycle()
+                    enhancedBitmap = freqOutput
+                    Log.d(TAG, "║   - Frequency separation applied")
+                } else {
+                    freqOutput.recycle()
+                    Log.w(TAG, "║   - Frequency separation failed, skipping")
+                }
+                
+                // Step 2: Anisotropic edge-aware filtering
+                Log.i(TAG, "║ Stage 3.5b: Anisotropic filtering...")
+                val anisoOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+                val anisoConfig = AnisotropicFilterConfig(
+                    kernelSigma = 1.5f,
+                    elongation = 2.5f,
+                    noiseThreshold = 0.015f
+                )
+                
+                if (NativeMFSRPipeline.applyAnisotropicFilter(enhancedBitmap, anisoOutput, anisoConfig)) {
+                    if (enhancedBitmap !== outputBitmap) enhancedBitmap.recycle()
+                    enhancedBitmap = anisoOutput
+                    Log.d(TAG, "║   - Anisotropic filtering applied")
+                } else {
+                    anisoOutput.recycle()
+                    Log.w(TAG, "║   - Anisotropic filtering failed, skipping")
+                }
+                
+                // Step 3: Drizzle sub-pixel enhancement (if we have multiple aligned frames)
+                if (correctedFrames.size >= 3) {
+                    Log.i(TAG, "║ Stage 3.5c: Drizzle sub-pixel enhancement...")
+                    
+                    // Use Drizzle to combine sub-pixel information from aligned frames
+                    val drizzleOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+                    val drizzleConfig = DrizzleConfig(
+                        scaleFactor = 2,
+                        pixfrac = 0.7f
+                    )
+                    
+                    // Convert homographies to sub-pixel shifts (extract translation component)
+                    val shifts = homographies.map { h ->
+                        SubPixelShift(
+                            dx = h.m02,  // Translation X
+                            dy = h.m12,  // Translation Y
+                            weight = 1.0f
+                        )
+                    }
+                    
+                    try {
+                        if (applyDrizzle(
+                            correctedFrames.map { it.bitmap }.toTypedArray(),
+                            shifts,
+                            drizzleOutput,
+                            drizzleConfig
+                        )) {
+                            // Blend Drizzle result with MFSR output for best of both
+                            blendBitmaps(enhancedBitmap, drizzleOutput, 0.3f)
+                            Log.d(TAG, "║   - Drizzle enhancement applied")
+                        }
+                        drizzleOutput.recycle()
+                    } catch (e: Exception) {
+                        drizzleOutput.recycle()
+                        Log.w(TAG, "║   - Drizzle failed, skipping", e)
+                    }
+                }
+                
+                // Step 4: Texture synthesis for low-detail regions
+                Log.i(TAG, "║ Stage 3.5d: Texture synthesis...")
+                val texOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+                val texConfig = TextureSynthConfig(
+                    patchSize = 7,
+                    searchRadius = 24,
+                    blendWeight = 0.4f
+                )
+                
+                if (synthesizeTexture(enhancedBitmap, texOutput, texConfig)) {
+                    if (enhancedBitmap !== outputBitmap) enhancedBitmap.recycle()
+                    enhancedBitmap = texOutput
+                    Log.d(TAG, "║   - Texture synthesis applied")
+                } else {
+                    texOutput.recycle()
+                    Log.w(TAG, "║   - Texture synthesis failed, skipping")
+                }
+                
+            } catch (e: Exception) {
+                Log.w(TAG, "║ Stage 3.5: Enhanced processing failed", e)
+                // Continue with whatever we have
+            }
+            
+            stage35Time = System.currentTimeMillis() - stage35Start
+            Log.i(TAG, "║ Stage 3.5: Enhanced detail processing completed in ${stage35Time}ms")
+        }
+        
         // Stage 4: Neural refinement (optional, ULTRA preset only)
         val stage4Start = System.currentTimeMillis()
         val finalBitmap = if (mfsrRefiner?.isReady() == true && preset == UltraDetailPreset.ULTRA) {
             Log.i(TAG, "║ Stage 4: Neural refinement starting (ULTRA preset)...")
             _state.value = PipelineState.RefiningMFSR(0, 0)
             
+            var lastRefineUpdate = 0L
             try {
-                mfsrRefiner!!.refine(outputBitmap) { processed, total, _ ->
-                    _state.value = PipelineState.RefiningMFSR(processed, total)
+                mfsrRefiner!!.refine(enhancedBitmap) { processed, total, _ ->
+                    // Throttle UI updates to reduce main thread load (max 10/sec)
+                    val now = System.currentTimeMillis()
+                    if (now - lastRefineUpdate >= 100 || processed == total) {
+                        _state.value = PipelineState.RefiningMFSR(processed, total)
+                        lastRefineUpdate = now
+                    }
                 }.also {
-                    if (it !== outputBitmap) {
-                        outputBitmap.recycle()
+                    if (it !== enhancedBitmap && enhancedBitmap !== outputBitmap) {
+                        enhancedBitmap.recycle()
                     }
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "║ Stage 4: Refinement failed, using MFSR output", e)
-                outputBitmap
+                Log.w(TAG, "║ Stage 4: Refinement failed, using enhanced output", e)
+                enhancedBitmap
             }
         } else {
             Log.i(TAG, "║ Stage 4: Neural refinement SKIPPED (preset=$preset, refiner ready=${mfsrRefiner?.isReady()})")
-            outputBitmap
+            enhancedBitmap
         }
         val stage4Time = System.currentTimeMillis() - stage4Start
         if (preset == UltraDetailPreset.ULTRA) {
@@ -699,7 +972,7 @@ class UltraDetailPipeline(
         Log.i(TAG, "║ HQ MFSR PIPELINE COMPLETE")
         Log.i(TAG, "║ Total time: ${processingTime}ms")
         Log.i(TAG, "║ Output: ${finalBitmap.width}x${finalBitmap.height} (${"%.2f".format(finalMegapixels)}MP)")
-        Log.i(TAG, "║ Stages: Gyro=${stage1Time}ms, RGBMask=${stage2Time}ms, MFSR=${stage3Time}ms, Refine=${stage4Time}ms")
+        Log.i(TAG, "║ Stages: Align=${stage1Time}ms, RS=${stage15Time}ms, Mask=${stage2Time}ms, MFSR=${stage3Time}ms, Enhance=${stage35Time}ms, Refine=${stage4Time}ms")
         Log.i(TAG, "═══════════════════════════════════════════════════════════")
         
         // Calculate actual scale factor (ULTRA = MFSR 2x * ESRGAN 4x = 8x)
@@ -749,6 +1022,79 @@ class UltraDetailPipeline(
         }
         
         return homographies
+    }
+    
+    /**
+     * Blend two homographies with a weight factor
+     * @param gyroH Gyro-based homography
+     * @param orbH ORB-based homography (as FloatArray)
+     * @param orbWeight Weight for ORB homography (0-1)
+     */
+    private fun blendHomographies(gyroH: Homography, orbH: FloatArray, orbWeight: Float): Homography {
+        val gyroWeight = 1f - orbWeight
+        val blended = FloatArray(9)
+        
+        // Get gyro homography values
+        val gyroValues = floatArrayOf(
+            gyroH.m00, gyroH.m01, gyroH.m02,
+            gyroH.m10, gyroH.m11, gyroH.m12,
+            gyroH.m20, gyroH.m21, gyroH.m22
+        )
+        
+        // Blend each element
+        for (i in 0 until 9) {
+            blended[i] = gyroValues[i] * gyroWeight + orbH[i] * orbWeight
+        }
+        
+        // Normalize so h22 = 1
+        if (kotlin.math.abs(blended[8]) > 1e-6f) {
+            val scale = 1f / blended[8]
+            for (i in 0 until 9) blended[i] *= scale
+        }
+        
+        return Homography(
+            blended[0], blended[1], blended[2],
+            blended[3], blended[4], blended[5],
+            blended[6], blended[7], blended[8]
+        )
+    }
+    
+    /**
+     * Blend two bitmaps in-place (modifies target)
+     * @param target Target bitmap to blend into
+     * @param source Source bitmap to blend from
+     * @param sourceWeight Weight for source (0-1)
+     */
+    private fun blendBitmaps(target: Bitmap, source: Bitmap, sourceWeight: Float) {
+        if (target.width != source.width || target.height != source.height) {
+            Log.w(TAG, "blendBitmaps: Size mismatch, skipping")
+            return
+        }
+        
+        val targetWeight = 1f - sourceWeight
+        val width = target.width
+        val height = target.height
+        val pixels = IntArray(width)
+        val srcPixels = IntArray(width)
+        
+        for (y in 0 until height) {
+            target.getPixels(pixels, 0, width, 0, y, width, 1)
+            source.getPixels(srcPixels, 0, width, 0, y, width, 1)
+            
+            for (x in 0 until width) {
+                val tp = pixels[x]
+                val sp = srcPixels[x]
+                
+                val r = ((tp shr 16 and 0xFF) * targetWeight + (sp shr 16 and 0xFF) * sourceWeight).toInt()
+                val g = ((tp shr 8 and 0xFF) * targetWeight + (sp shr 8 and 0xFF) * sourceWeight).toInt()
+                val b = ((tp and 0xFF) * targetWeight + (sp and 0xFF) * sourceWeight).toInt()
+                val a = tp shr 24 and 0xFF
+                
+                pixels[x] = (a shl 24) or (r shl 16) or (g shl 8) or b
+            }
+            
+            target.setPixels(pixels, 0, width, 0, y, width, 1)
+        }
     }
     
     /**
@@ -937,9 +1283,15 @@ class UltraDetailPipeline(
         val finalBitmap = if (mfsrRefiner?.isReady() == true) {
             _state.value = PipelineState.RefiningMFSR(0, 0)
             
+            var lastRefineUpdate2 = 0L
             try {
                 mfsrRefiner!!.refine(outputBitmap) { processed, total, _ ->
-                    _state.value = PipelineState.RefiningMFSR(processed, total)
+                    // Throttle UI updates to reduce main thread load (max 10/sec)
+                    val now = System.currentTimeMillis()
+                    if (now - lastRefineUpdate2 >= 100 || processed == total) {
+                        _state.value = PipelineState.RefiningMFSR(processed, total)
+                        lastRefineUpdate2 = now
+                    }
                 }.also {
                     if (it !== outputBitmap) {
                         outputBitmap.recycle()

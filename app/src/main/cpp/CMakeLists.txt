@@ -32,6 +32,16 @@ set(ULTRADETAIL_SOURCES
     edge_detection.cpp
     yuv_converter.cpp
     mfsr.cpp
+    # Phase 1 enhancements
+    freq_separation.cpp
+    anisotropic_merge.cpp
+    # Phase 2 enhancements
+    orb_alignment.cpp
+    drizzle.cpp
+    rolling_shutter.cpp
+    # Phase 3 enhancements
+    kalman_fusion.cpp
+    texture_synthesis.cpp
 )
 
 # Header files
@@ -48,6 +58,16 @@ set(ULTRADETAIL_HEADERS
     neon_utils.h
     common.h
     mfsr.h
+    # Phase 1 enhancements
+    freq_separation.h
+    anisotropic_merge.h
+    # Phase 2 enhancements
+    orb_alignment.h
+    drizzle.h
+    rolling_shutter.h
+    # Phase 3 enhancements
+    kalman_fusion.h
+    texture_synthesis.h
 )
 
 # Create shared library

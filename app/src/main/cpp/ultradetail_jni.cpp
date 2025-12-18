@@ -9,6 +9,13 @@
 #include "burst_processor.h"
 #include "yuv_converter.h"
 #include "tiled_pipeline.h"
+#include "freq_separation.h"
+#include "anisotropic_merge.h"
+#include "orb_alignment.h"
+#include "drizzle.h"
+#include "rolling_shutter.h"
+#include "kalman_fusion.h"
+#include "texture_synthesis.h"
 
 using namespace ultradetail;
 
@@ -1284,6 +1291,803 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeSelectReferenceFrame(
     
     LOGD("Selected reference frame %d (gyro magnitude: %.4f)", bestIdx, minMag);
     return bestIdx;
+}
+
+// ==================== Phase 1: Frequency Separation ====================
+
+/**
+ * Apply frequency separation enhancement to a bitmap
+ * 
+ * @param inputBitmap Input ARGB_8888 bitmap
+ * @param outputBitmap Output ARGB_8888 bitmap (same size as input)
+ * @param lowPassSigma Gaussian sigma for low-frequency extraction
+ * @param highBoost High-frequency amplification factor
+ * @param edgeProtection Edge protection strength (0-1)
+ * @param blendStrength Final blend with original (0-1)
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeApplyFreqSeparation(
+    JNIEnv* env,
+    jclass clazz,
+    jobject inputBitmap,
+    jobject outputBitmap,
+    jfloat lowPassSigma,
+    jfloat highBoost,
+    jfloat edgeProtection,
+    jfloat blendStrength
+) {
+    AndroidBitmapInfo inInfo, outInfo;
+    void* inPixels;
+    void* outPixels;
+    
+    if (AndroidBitmap_getInfo(env, inputBitmap, &inInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("FreqSep: Failed to get bitmap info");
+        return -1;
+    }
+    
+    if (inInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888 ||
+        outInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        LOGE("FreqSep: Bitmap format must be ARGB_8888");
+        return -2;
+    }
+    
+    if (inInfo.width != outInfo.width || inInfo.height != outInfo.height) {
+        LOGE("FreqSep: Input/output size mismatch");
+        return -3;
+    }
+    
+    if (AndroidBitmap_lockPixels(env, inputBitmap, &inPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("FreqSep: Failed to lock pixels");
+        return -4;
+    }
+    
+    int width = inInfo.width;
+    int height = inInfo.height;
+    
+    // Convert to RGBImage
+    RGBImage input, output;
+    input.resize(width, height);
+    
+    uint8_t* src = static_cast<uint8_t*>(inPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = src + y * inInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            int idx = x * 4;
+            input.at(x, y) = RGBPixel(
+                row[idx + 0] / 255.0f,
+                row[idx + 1] / 255.0f,
+                row[idx + 2] / 255.0f
+            );
+        }
+    }
+    
+    // Apply frequency separation
+    FreqSeparationParams params;
+    params.lowPassSigma = lowPassSigma;
+    params.highBoost = highBoost;
+    params.edgeProtection = edgeProtection;
+    params.blendStrength = blendStrength;
+    
+    FreqSeparationProcessor processor(params);
+    processor.processRGB(input, output);
+    
+    // Copy to output bitmap
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            const RGBPixel& p = output.at(x, y);
+            int idx = x * 4;
+            row[idx + 0] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, inputBitmap);
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("FreqSep: Processed %dx%d (sigma=%.1f, boost=%.1f, edge=%.1f, blend=%.1f)",
+         width, height, lowPassSigma, highBoost, edgeProtection, blendStrength);
+    
+    return 0;
+}
+
+// ==================== Phase 1: Anisotropic Merge ====================
+
+/**
+ * Apply anisotropic filtering to a bitmap (edge-aware smoothing)
+ * 
+ * @param inputBitmap Input ARGB_8888 bitmap
+ * @param outputBitmap Output ARGB_8888 bitmap (same size as input)
+ * @param kernelSigma Base sigma for anisotropic kernel
+ * @param elongation Kernel elongation along edges
+ * @param noiseThreshold Below this, use isotropic kernel
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeApplyAnisotropicFilter(
+    JNIEnv* env,
+    jclass clazz,
+    jobject inputBitmap,
+    jobject outputBitmap,
+    jfloat kernelSigma,
+    jfloat elongation,
+    jfloat noiseThreshold
+) {
+    AndroidBitmapInfo inInfo, outInfo;
+    void* inPixels;
+    void* outPixels;
+    
+    if (AndroidBitmap_getInfo(env, inputBitmap, &inInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("AnisotropicFilter: Failed to get bitmap info");
+        return -1;
+    }
+    
+    if (inInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888 ||
+        outInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        LOGE("AnisotropicFilter: Bitmap format must be ARGB_8888");
+        return -2;
+    }
+    
+    if (AndroidBitmap_lockPixels(env, inputBitmap, &inPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("AnisotropicFilter: Failed to lock pixels");
+        return -3;
+    }
+    
+    int width = inInfo.width;
+    int height = inInfo.height;
+    
+    // Convert to RGBImage
+    RGBImage input, output;
+    input.resize(width, height);
+    
+    uint8_t* src = static_cast<uint8_t*>(inPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = src + y * inInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            int idx = x * 4;
+            input.at(x, y) = RGBPixel(
+                row[idx + 0] / 255.0f,
+                row[idx + 1] / 255.0f,
+                row[idx + 2] / 255.0f
+            );
+        }
+    }
+    
+    // Apply anisotropic filtering
+    AnisotropicMergeParams params;
+    params.kernelSigma = kernelSigma;
+    params.elongation = elongation;
+    params.noiseThreshold = noiseThreshold;
+    
+    AnisotropicMergeProcessor processor(params);
+    processor.filterRGB(input, output);
+    
+    // Copy to output bitmap
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            const RGBPixel& p = output.at(x, y);
+            int idx = x * 4;
+            row[idx + 0] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, inputBitmap);
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("AnisotropicFilter: Processed %dx%d (sigma=%.1f, elong=%.1f, noise=%.3f)",
+         width, height, kernelSigma, elongation, noiseThreshold);
+    
+    return 0;
+}
+
+// ==================== Phase 2: ORB Alignment ====================
+
+/**
+ * Align two bitmaps using ORB feature matching
+ * Returns homography as 9 floats (row-major 3x3 matrix)
+ * 
+ * @param referenceBitmap Reference frame
+ * @param frameBitmap Frame to align
+ * @param homographyOut Output array for 9 homography values
+ * @param maxKeypoints Maximum keypoints to detect
+ * @param ransacThreshold RANSAC inlier threshold in pixels
+ * @return Number of inliers, or negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeAlignORB(
+    JNIEnv* env,
+    jclass clazz,
+    jobject referenceBitmap,
+    jobject frameBitmap,
+    jfloatArray homographyOut,
+    jint maxKeypoints,
+    jfloat ransacThreshold
+) {
+    AndroidBitmapInfo refInfo, frameInfo;
+    void* refPixels;
+    void* framePixels;
+    
+    if (AndroidBitmap_getInfo(env, referenceBitmap, &refInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_getInfo(env, frameBitmap, &frameInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("ORB: Failed to get bitmap info");
+        return -1;
+    }
+    
+    if (AndroidBitmap_lockPixels(env, referenceBitmap, &refPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_lockPixels(env, frameBitmap, &framePixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("ORB: Failed to lock pixels");
+        return -2;
+    }
+    
+    int width = refInfo.width;
+    int height = refInfo.height;
+    
+    // Convert to grayscale
+    GrayImage refGray, frameGray;
+    refGray.resize(width, height);
+    frameGray.resize(width, height);
+    
+    uint8_t* refSrc = static_cast<uint8_t*>(refPixels);
+    uint8_t* frameSrc = static_cast<uint8_t*>(framePixels);
+    
+    for (int y = 0; y < height; ++y) {
+        uint8_t* refRow = refSrc + y * refInfo.stride;
+        uint8_t* frameRow = frameSrc + y * frameInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            int idx = x * 4;
+            // Luminance from RGB
+            refGray.at(x, y) = (0.299f * refRow[idx] + 0.587f * refRow[idx+1] + 0.114f * refRow[idx+2]) / 255.0f;
+            frameGray.at(x, y) = (0.299f * frameRow[idx] + 0.587f * frameRow[idx+1] + 0.114f * frameRow[idx+2]) / 255.0f;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, referenceBitmap);
+    AndroidBitmap_unlockPixels(env, frameBitmap);
+    
+    // Run ORB alignment
+    ORBAlignmentParams params;
+    params.maxKeypoints = maxKeypoints;
+    params.ransacThreshold = ransacThreshold;
+    
+    ORBAligner aligner(params);
+    ORBAlignmentResult result = aligner.align(refGray, frameGray);
+    
+    // Copy homography to output
+    jfloat* homOut = env->GetFloatArrayElements(homographyOut, nullptr);
+    for (int i = 0; i < 9; ++i) {
+        homOut[i] = result.homography.data[i];
+    }
+    env->ReleaseFloatArrayElements(homographyOut, homOut, 0);
+    
+    LOGI("ORB: Aligned %dx%d, inliers=%d/%d (%.1f%%), success=%s",
+         width, height, result.inlierCount, result.totalMatches,
+         result.inlierRatio * 100, result.success ? "yes" : "no");
+    
+    return result.success ? result.inlierCount : -3;
+}
+
+// ==================== Phase 2: Drizzle ====================
+
+/**
+ * Apply drizzle algorithm to combine multiple bitmaps
+ * 
+ * @param inputBitmaps Array of input bitmaps
+ * @param shifts Sub-pixel shifts as flat array [dx0, dy0, w0, dx1, dy1, w1, ...]
+ * @param outputBitmap Pre-allocated output bitmap (scaled size)
+ * @param scaleFactor Output scale factor
+ * @param pixfrac Drop size fraction (0.1-1.0)
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeDrizzle(
+    JNIEnv* env,
+    jclass clazz,
+    jobjectArray inputBitmaps,
+    jfloatArray shifts,
+    jobject outputBitmap,
+    jint scaleFactor,
+    jfloat pixfrac
+) {
+    int numFrames = env->GetArrayLength(inputBitmaps);
+    if (numFrames < 2) {
+        LOGE("Drizzle: Need at least 2 frames");
+        return -1;
+    }
+    
+    // Get shifts
+    jfloat* shiftData = env->GetFloatArrayElements(shifts, nullptr);
+    std::vector<SubPixelShift> subPixelShifts(numFrames);
+    for (int i = 0; i < numFrames; ++i) {
+        subPixelShifts[i].dx = shiftData[i * 3];
+        subPixelShifts[i].dy = shiftData[i * 3 + 1];
+        subPixelShifts[i].weight = shiftData[i * 3 + 2];
+    }
+    env->ReleaseFloatArrayElements(shifts, shiftData, JNI_ABORT);
+    
+    // Get first bitmap to determine size
+    jobject firstBitmap = env->GetObjectArrayElement(inputBitmaps, 0);
+    AndroidBitmapInfo firstInfo;
+    AndroidBitmap_getInfo(env, firstBitmap, &firstInfo);
+    
+    int inWidth = firstInfo.width;
+    int inHeight = firstInfo.height;
+    
+    // Load all frames
+    std::vector<RGBImage> frames(numFrames);
+    for (int f = 0; f < numFrames; ++f) {
+        jobject bitmap = env->GetObjectArrayElement(inputBitmaps, f);
+        void* pixels;
+        AndroidBitmapInfo info;
+        
+        AndroidBitmap_getInfo(env, bitmap, &info);
+        AndroidBitmap_lockPixels(env, bitmap, &pixels);
+        
+        frames[f].resize(info.width, info.height);
+        uint8_t* src = static_cast<uint8_t*>(pixels);
+        
+        for (int y = 0; y < static_cast<int>(info.height); ++y) {
+            uint8_t* row = src + y * info.stride;
+            for (int x = 0; x < static_cast<int>(info.width); ++x) {
+                int idx = x * 4;
+                frames[f].at(x, y) = RGBPixel(
+                    row[idx] / 255.0f,
+                    row[idx + 1] / 255.0f,
+                    row[idx + 2] / 255.0f
+                );
+            }
+        }
+        
+        AndroidBitmap_unlockPixels(env, bitmap);
+    }
+    
+    // Run drizzle
+    DrizzleParams params;
+    params.scaleFactor = scaleFactor;
+    params.pixfrac = pixfrac;
+    
+    DrizzleProcessor processor(params);
+    DrizzleResult result = processor.process(frames, subPixelShifts, 0);
+    
+    if (!result.success) {
+        LOGE("Drizzle: Processing failed");
+        return -2;
+    }
+    
+    // Copy to output bitmap
+    AndroidBitmapInfo outInfo;
+    void* outPixels;
+    AndroidBitmap_getInfo(env, outputBitmap, &outInfo);
+    AndroidBitmap_lockPixels(env, outputBitmap, &outPixels);
+    
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < result.outputHeight; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < result.outputWidth; ++x) {
+            const RGBPixel& p = result.output.at(x, y);
+            int idx = x * 4;
+            row[idx] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("Drizzle: %d frames %dx%d -> %dx%d (scale=%d, pixfrac=%.2f, coverage=%.2f)",
+         numFrames, inWidth, inHeight, result.outputWidth, result.outputHeight,
+         scaleFactor, pixfrac, result.avgCoverage);
+    
+    return 0;
+}
+
+// ==================== Phase 2: Rolling Shutter Correction ====================
+
+/**
+ * Correct rolling shutter distortion using gyro data
+ * 
+ * @param inputBitmap Input bitmap with RS distortion
+ * @param outputBitmap Output corrected bitmap (same size)
+ * @param gyroData Gyro samples as flat array [t0, rx0, ry0, rz0, t1, rx1, ...]
+ * @param readoutTimeMs Frame readout time in milliseconds
+ * @param focalLengthPx Focal length in pixels
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeCorrectRollingShutter(
+    JNIEnv* env,
+    jclass clazz,
+    jobject inputBitmap,
+    jobject outputBitmap,
+    jfloatArray gyroData,
+    jfloat readoutTimeMs,
+    jfloat focalLengthPx
+) {
+    AndroidBitmapInfo inInfo, outInfo;
+    void* inPixels;
+    void* outPixels;
+    
+    if (AndroidBitmap_getInfo(env, inputBitmap, &inInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("RS: Failed to get bitmap info");
+        return -1;
+    }
+    
+    if (AndroidBitmap_lockPixels(env, inputBitmap, &inPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("RS: Failed to lock pixels");
+        return -2;
+    }
+    
+    int width = inInfo.width;
+    int height = inInfo.height;
+    
+    // Convert to RGBImage
+    RGBImage input;
+    input.resize(width, height);
+    
+    uint8_t* src = static_cast<uint8_t*>(inPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = src + y * inInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            int idx = x * 4;
+            input.at(x, y) = RGBPixel(
+                row[idx] / 255.0f,
+                row[idx + 1] / 255.0f,
+                row[idx + 2] / 255.0f
+            );
+        }
+    }
+    
+    // Parse gyro data
+    int gyroLen = env->GetArrayLength(gyroData);
+    int numSamples = gyroLen / 4;
+    jfloat* gyro = env->GetFloatArrayElements(gyroData, nullptr);
+    
+    std::vector<GyroSampleRS> samples(numSamples);
+    for (int i = 0; i < numSamples; ++i) {
+        samples[i].timestamp = gyro[i * 4];
+        samples[i].rotX = gyro[i * 4 + 1];
+        samples[i].rotY = gyro[i * 4 + 2];
+        samples[i].rotZ = gyro[i * 4 + 3];
+    }
+    env->ReleaseFloatArrayElements(gyroData, gyro, JNI_ABORT);
+    
+    // Run correction
+    RollingShutterParams params;
+    params.readoutTimeMs = readoutTimeMs;
+    params.focalLengthPx = focalLengthPx;
+    
+    RollingShutterCorrector corrector(params);
+    RSCorrectionResult result = corrector.correct(input, samples, 0.0f);
+    
+    AndroidBitmap_unlockPixels(env, inputBitmap);
+    
+    if (!result.success) {
+        AndroidBitmap_unlockPixels(env, outputBitmap);
+        LOGE("RS: Correction failed");
+        return -3;
+    }
+    
+    // Copy to output
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            const RGBPixel& p = result.corrected.at(x, y);
+            int idx = x * 4;
+            row[idx] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("RS: Corrected %dx%d, max_disp=%.2f, avg_disp=%.2f",
+         width, height, result.maxDisplacement, result.avgDisplacement);
+    
+    return 0;
+}
+
+// ==================== Phase 3: Kalman Fusion ====================
+
+/**
+ * Fuse gyro and optical flow measurements using Kalman filter
+ * 
+ * @param gyroData Gyro samples [t, rx, ry, rz, dt, ...] per frame
+ * @param flowData Optical flow [dx, dy, confidence, ...] per frame pair
+ * @param numFrames Number of frames
+ * @param outputMotion Output fused motion [x, y, vx, vy, uncertainty, ...]
+ * @param gyroWeight Weight for gyro measurements
+ * @param flowWeight Weight for flow measurements
+ * @return Number of fused results, or negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeKalmanFusion(
+    JNIEnv* env,
+    jclass clazz,
+    jfloatArray gyroData,
+    jfloatArray flowData,
+    jint numFrames,
+    jfloatArray outputMotion,
+    jfloat gyroWeight,
+    jfloat flowWeight
+) {
+    if (numFrames < 2) {
+        LOGE("KalmanFusion: Need at least 2 frames");
+        return -1;
+    }
+    
+    // Parse gyro data (5 floats per sample: t, rx, ry, rz, dt)
+    int gyroLen = env->GetArrayLength(gyroData);
+    jfloat* gyro = env->GetFloatArrayElements(gyroData, nullptr);
+    
+    // Parse flow data (3 floats per frame pair: dx, dy, confidence)
+    int flowLen = env->GetArrayLength(flowData);
+    jfloat* flow = env->GetFloatArrayElements(flowData, nullptr);
+    
+    int numFlows = flowLen / 3;
+    
+    // Build measurements
+    std::vector<std::vector<GyroMeasurement>> allGyro(numFlows);
+    std::vector<FlowMeasurement> flows(numFlows);
+    
+    // Distribute gyro samples across frame intervals (simplified)
+    int samplesPerInterval = (gyroLen / 5) / numFlows;
+    int gyroIdx = 0;
+    
+    for (int i = 0; i < numFlows; ++i) {
+        // Gyro samples for this interval
+        for (int j = 0; j < samplesPerInterval && gyroIdx * 5 + 4 < gyroLen; ++j, ++gyroIdx) {
+            GyroMeasurement m;
+            m.timestamp = gyro[gyroIdx * 5];
+            m.rotX = gyro[gyroIdx * 5 + 1];
+            m.rotY = gyro[gyroIdx * 5 + 2];
+            m.rotZ = gyro[gyroIdx * 5 + 3];
+            m.dt = gyro[gyroIdx * 5 + 4];
+            allGyro[i].push_back(m);
+        }
+        
+        // Flow measurement
+        flows[i].dx = flow[i * 3];
+        flows[i].dy = flow[i * 3 + 1];
+        flows[i].confidence = flow[i * 3 + 2];
+    }
+    
+    env->ReleaseFloatArrayElements(gyroData, gyro, JNI_ABORT);
+    env->ReleaseFloatArrayElements(flowData, flow, JNI_ABORT);
+    
+    // Run Kalman fusion
+    KalmanFusionParams params;
+    params.gyroWeight = gyroWeight;
+    params.flowWeight = flowWeight;
+    
+    KalmanFusionProcessor processor(params);
+    std::vector<FusionResult> results = processor.fuseBatch(allGyro, flows);
+    
+    // Copy results to output (5 floats per result: x, y, vx, vy, uncertainty)
+    jfloat* out = env->GetFloatArrayElements(outputMotion, nullptr);
+    for (size_t i = 0; i < results.size(); ++i) {
+        out[i * 5] = results[i].motion.x;
+        out[i * 5 + 1] = results[i].motion.y;
+        out[i * 5 + 2] = results[i].motion.vx;
+        out[i * 5 + 3] = results[i].motion.vy;
+        out[i * 5 + 4] = results[i].uncertainty;
+    }
+    env->ReleaseFloatArrayElements(outputMotion, out, 0);
+    
+    LOGI("KalmanFusion: Fused %zu frame pairs (gyroW=%.2f, flowW=%.2f)",
+         results.size(), gyroWeight, flowWeight);
+    
+    return static_cast<int>(results.size());
+}
+
+// ==================== Phase 3: Texture Synthesis ====================
+
+/**
+ * Synthesize texture details for an image
+ * 
+ * @param inputBitmap Input bitmap (potentially lacking detail)
+ * @param outputBitmap Output bitmap with synthesized details
+ * @param patchSize Synthesis patch size
+ * @param searchRadius Search radius for similar patches
+ * @param blendWeight Blend weight for synthesized detail
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeTextureSynthesis(
+    JNIEnv* env,
+    jclass clazz,
+    jobject inputBitmap,
+    jobject outputBitmap,
+    jint patchSize,
+    jint searchRadius,
+    jfloat blendWeight
+) {
+    AndroidBitmapInfo inInfo, outInfo;
+    void* inPixels;
+    void* outPixels;
+    
+    if (AndroidBitmap_getInfo(env, inputBitmap, &inInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("TextureSynth: Failed to get bitmap info");
+        return -1;
+    }
+    
+    if (AndroidBitmap_lockPixels(env, inputBitmap, &inPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("TextureSynth: Failed to lock pixels");
+        return -2;
+    }
+    
+    int width = inInfo.width;
+    int height = inInfo.height;
+    
+    // Convert to RGBImage
+    RGBImage input;
+    input.resize(width, height);
+    
+    uint8_t* src = static_cast<uint8_t*>(inPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = src + y * inInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            int idx = x * 4;
+            input.at(x, y) = RGBPixel(
+                row[idx] / 255.0f,
+                row[idx + 1] / 255.0f,
+                row[idx + 2] / 255.0f
+            );
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, inputBitmap);
+    
+    // Run texture synthesis
+    TextureSynthParams params;
+    params.patchSize = patchSize;
+    params.searchRadius = searchRadius;
+    params.blendWeight = blendWeight;
+    
+    TextureSynthProcessor processor(params);
+    TextureSynthResult result = processor.synthesize(input);
+    
+    if (!result.success) {
+        AndroidBitmap_unlockPixels(env, outputBitmap);
+        LOGE("TextureSynth: Synthesis failed");
+        return -3;
+    }
+    
+    // Copy to output
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            const RGBPixel& p = result.synthesized.at(x, y);
+            int idx = x * 4;
+            row[idx] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("TextureSynth: %dx%d, patches=%d, avgDetail=%.3f",
+         width, height, result.patchesProcessed, result.avgDetailAdded);
+    
+    return 0;
+}
+
+/**
+ * Transfer texture from source to target regions
+ * 
+ * @param targetBitmap Target bitmap to enhance
+ * @param sourceBitmap Source bitmap with texture
+ * @param maskData Mask array (1 float per pixel, 0-1)
+ * @param outputBitmap Output enhanced bitmap
+ * @param blendWeight Blend weight
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeTextureTransfer(
+    JNIEnv* env,
+    jclass clazz,
+    jobject targetBitmap,
+    jobject sourceBitmap,
+    jfloatArray maskData,
+    jobject outputBitmap,
+    jfloat blendWeight
+) {
+    AndroidBitmapInfo tgtInfo, srcInfo, outInfo;
+    void* tgtPixels;
+    void* srcPixels;
+    void* outPixels;
+    
+    AndroidBitmap_getInfo(env, targetBitmap, &tgtInfo);
+    AndroidBitmap_getInfo(env, sourceBitmap, &srcInfo);
+    AndroidBitmap_getInfo(env, outputBitmap, &outInfo);
+    
+    AndroidBitmap_lockPixels(env, targetBitmap, &tgtPixels);
+    AndroidBitmap_lockPixels(env, sourceBitmap, &srcPixels);
+    AndroidBitmap_lockPixels(env, outputBitmap, &outPixels);
+    
+    int width = tgtInfo.width;
+    int height = tgtInfo.height;
+    
+    // Convert to RGBImage
+    RGBImage target, source;
+    target.resize(width, height);
+    source.resize(width, height);
+    
+    uint8_t* tgtSrc = static_cast<uint8_t*>(tgtPixels);
+    uint8_t* srcSrc = static_cast<uint8_t*>(srcPixels);
+    
+    for (int y = 0; y < height; ++y) {
+        uint8_t* tgtRow = tgtSrc + y * tgtInfo.stride;
+        uint8_t* srcRow = srcSrc + y * srcInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            int idx = x * 4;
+            target.at(x, y) = RGBPixel(tgtRow[idx]/255.0f, tgtRow[idx+1]/255.0f, tgtRow[idx+2]/255.0f);
+            source.at(x, y) = RGBPixel(srcRow[idx]/255.0f, srcRow[idx+1]/255.0f, srcRow[idx+2]/255.0f);
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, targetBitmap);
+    AndroidBitmap_unlockPixels(env, sourceBitmap);
+    
+    // Parse mask
+    GrayImage mask;
+    mask.resize(width, height);
+    jfloat* maskPtr = env->GetFloatArrayElements(maskData, nullptr);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            mask.at(x, y) = maskPtr[y * width + x];
+        }
+    }
+    env->ReleaseFloatArrayElements(maskData, maskPtr, JNI_ABORT);
+    
+    // Transfer texture
+    TextureSynthParams params;
+    params.blendWeight = blendWeight;
+    
+    TextureSynthProcessor processor(params);
+    RGBImage result = processor.transferTexture(target, source, mask);
+    
+    // Copy to output
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            const RGBPixel& p = result.at(x, y);
+            int idx = x * 4;
+            row[idx] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("TextureTransfer: %dx%d complete", width, height);
+    
+    return 0;
 }
 
 } // extern "C"

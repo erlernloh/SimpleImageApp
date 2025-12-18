@@ -375,5 +375,492 @@ class NativeMFSRPipeline private constructor(
         
         @JvmStatic
         private external fun nativeDestroy(handle: Long)
+        
+        // ==================== Phase 1: Enhancement Functions ====================
+        
+        /**
+         * Apply frequency separation enhancement to a bitmap
+         * Separates image into low/high frequency, boosts high-freq with edge protection
+         * 
+         * @param input Input bitmap (ARGB_8888)
+         * @param output Output bitmap (same size, ARGB_8888)
+         * @param lowPassSigma Gaussian sigma for low-frequency extraction (default 2.0)
+         * @param highBoost High-frequency amplification factor (default 1.5)
+         * @param edgeProtection Edge protection strength 0-1 (default 0.8)
+         * @param blendStrength Final blend with original 0-1 (default 1.0)
+         * @return 0 on success, negative on error
+         */
+        @JvmStatic
+        external fun nativeApplyFreqSeparation(
+            input: Bitmap,
+            output: Bitmap,
+            lowPassSigma: Float,
+            highBoost: Float,
+            edgeProtection: Float,
+            blendStrength: Float
+        ): Int
+        
+        /**
+         * Apply frequency separation with default parameters
+         */
+        fun applyFreqSeparation(
+            input: Bitmap,
+            output: Bitmap,
+            params: FreqSeparationConfig = FreqSeparationConfig()
+        ): Boolean {
+            if (!libraryLoaded) return false
+            val result = nativeApplyFreqSeparation(
+                input, output,
+                params.lowPassSigma,
+                params.highBoost,
+                params.edgeProtection,
+                params.blendStrength
+            )
+            return result == 0
+        }
+        
+        /**
+         * Apply anisotropic filtering (edge-aware smoothing)
+         * Blends along edges, not across them - preserves sharpness while reducing noise
+         * 
+         * @param input Input bitmap (ARGB_8888)
+         * @param output Output bitmap (same size, ARGB_8888)
+         * @param kernelSigma Base sigma for anisotropic kernel (default 1.5)
+         * @param elongation Kernel elongation along edges (default 3.0)
+         * @param noiseThreshold Below this, use isotropic kernel (default 0.01)
+         * @return 0 on success, negative on error
+         */
+        @JvmStatic
+        external fun nativeApplyAnisotropicFilter(
+            input: Bitmap,
+            output: Bitmap,
+            kernelSigma: Float,
+            elongation: Float,
+            noiseThreshold: Float
+        ): Int
+        
+        /**
+         * Apply anisotropic filtering with default parameters
+         */
+        fun applyAnisotropicFilter(
+            input: Bitmap,
+            output: Bitmap,
+            params: AnisotropicFilterConfig = AnisotropicFilterConfig()
+        ): Boolean {
+            if (!libraryLoaded) return false
+            val result = nativeApplyAnisotropicFilter(
+                input, output,
+                params.kernelSigma,
+                params.elongation,
+                params.noiseThreshold
+            )
+            return result == 0
+        }
+        
+        /**
+         * Select best reference frame based on gyro stability
+         */
+        @JvmStatic
+        external fun nativeSelectReferenceFrame(gyroMagnitudes: FloatArray): Int
+        
+        // ==================== Phase 2: Native Methods ====================
+        
+        /**
+         * Align two bitmaps using ORB feature matching
+         */
+        @JvmStatic
+        external fun nativeAlignORB(
+            referenceBitmap: Bitmap,
+            frameBitmap: Bitmap,
+            homographyOut: FloatArray,
+            maxKeypoints: Int,
+            ransacThreshold: Float
+        ): Int
+        
+        /**
+         * Apply Drizzle algorithm to combine multiple frames
+         */
+        @JvmStatic
+        external fun nativeDrizzle(
+            inputBitmaps: Array<Bitmap>,
+            shifts: FloatArray,
+            outputBitmap: Bitmap,
+            scaleFactor: Int,
+            pixfrac: Float
+        ): Int
+        
+        /**
+         * Correct rolling shutter distortion using gyro data
+         */
+        @JvmStatic
+        external fun nativeCorrectRollingShutter(
+            inputBitmap: Bitmap,
+            outputBitmap: Bitmap,
+            gyroData: FloatArray,
+            readoutTimeMs: Float,
+            focalLengthPx: Float
+        ): Int
+        
+        // ==================== Phase 3: Native Methods ====================
+        
+        /**
+         * Fuse gyro and optical flow using Kalman filter
+         */
+        @JvmStatic
+        external fun nativeKalmanFusion(
+            gyroData: FloatArray,
+            flowData: FloatArray,
+            numFrames: Int,
+            outputMotion: FloatArray,
+            gyroWeight: Float,
+            flowWeight: Float
+        ): Int
+        
+        /**
+         * Synthesize texture details for an image
+         */
+        @JvmStatic
+        external fun nativeTextureSynthesis(
+            inputBitmap: Bitmap,
+            outputBitmap: Bitmap,
+            patchSize: Int,
+            searchRadius: Int,
+            blendWeight: Float
+        ): Int
+        
+        /**
+         * Transfer texture from source to target regions
+         */
+        @JvmStatic
+        external fun nativeTextureTransfer(
+            targetBitmap: Bitmap,
+            sourceBitmap: Bitmap,
+            maskData: FloatArray,
+            outputBitmap: Bitmap,
+            blendWeight: Float
+        ): Int
     }
+}
+
+/**
+ * Configuration for frequency separation enhancement
+ */
+data class FreqSeparationConfig(
+    val lowPassSigma: Float = 2.0f,      // Gaussian sigma for low-frequency
+    val highBoost: Float = 1.5f,          // High-frequency amplification
+    val edgeProtection: Float = 0.8f,     // Reduce boost near edges (0-1)
+    val blendStrength: Float = 1.0f       // Blend with original (0-1)
+)
+
+/**
+ * Configuration for anisotropic filtering
+ */
+data class AnisotropicFilterConfig(
+    val kernelSigma: Float = 1.5f,        // Base kernel sigma
+    val elongation: Float = 3.0f,         // Stretch along edges
+    val noiseThreshold: Float = 0.01f     // Isotropic below this
+)
+
+// ==================== Phase 2: ORB Alignment ====================
+
+/**
+ * Configuration for ORB feature alignment
+ */
+data class ORBAlignmentConfig(
+    val maxKeypoints: Int = 500,          // Maximum keypoints to detect
+    val ransacThreshold: Float = 3.0f     // RANSAC inlier threshold (pixels)
+)
+
+/**
+ * Result of ORB alignment
+ */
+data class ORBAlignmentResult(
+    val homography: FloatArray,           // 3x3 homography matrix (row-major)
+    val inlierCount: Int,                 // Number of RANSAC inliers
+    val success: Boolean                  // Whether alignment succeeded
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ORBAlignmentResult) return false
+        return homography.contentEquals(other.homography) && inlierCount == other.inlierCount && success == other.success
+    }
+    override fun hashCode(): Int = homography.contentHashCode() + inlierCount + success.hashCode()
+}
+
+/**
+ * Align two bitmaps using ORB feature matching
+ * 
+ * @param reference Reference frame
+ * @param frame Frame to align to reference
+ * @param config ORB alignment configuration
+ * @return Alignment result with homography matrix
+ */
+fun alignWithORB(
+    reference: Bitmap,
+    frame: Bitmap,
+    config: ORBAlignmentConfig = ORBAlignmentConfig()
+): ORBAlignmentResult {
+    val homography = FloatArray(9)
+    val inliers = NativeMFSRPipeline.nativeAlignORB(
+        reference, frame, homography,
+        config.maxKeypoints, config.ransacThreshold
+    )
+    return ORBAlignmentResult(
+        homography = homography,
+        inlierCount = if (inliers > 0) inliers else 0,
+        success = inliers > 0
+    )
+}
+
+// ==================== Phase 2: Drizzle Algorithm ====================
+
+/**
+ * Configuration for Drizzle algorithm
+ */
+data class DrizzleConfig(
+    val scaleFactor: Int = 2,             // Output scale (2x, 3x, 4x)
+    val pixfrac: Float = 0.7f             // Drop size fraction (0.1-1.0)
+)
+
+/**
+ * Sub-pixel shift for a frame
+ */
+data class SubPixelShift(
+    val dx: Float,                        // X shift in pixels
+    val dy: Float,                        // Y shift in pixels
+    val weight: Float = 1.0f              // Frame quality weight
+)
+
+/**
+ * Apply Drizzle algorithm to combine multiple frames
+ * 
+ * @param frames Input frames (aligned)
+ * @param shifts Sub-pixel shifts for each frame
+ * @param output Pre-allocated output bitmap (scaled size)
+ * @param config Drizzle configuration
+ * @return true on success
+ */
+fun applyDrizzle(
+    frames: Array<Bitmap>,
+    shifts: List<SubPixelShift>,
+    output: Bitmap,
+    config: DrizzleConfig = DrizzleConfig()
+): Boolean {
+    if (frames.size != shifts.size) return false
+    
+    // Flatten shifts to array [dx0, dy0, w0, dx1, dy1, w1, ...]
+    val shiftArray = FloatArray(shifts.size * 3)
+    shifts.forEachIndexed { i, shift ->
+        shiftArray[i * 3] = shift.dx
+        shiftArray[i * 3 + 1] = shift.dy
+        shiftArray[i * 3 + 2] = shift.weight
+    }
+    
+    val result = NativeMFSRPipeline.nativeDrizzle(
+        frames, shiftArray, output,
+        config.scaleFactor, config.pixfrac
+    )
+    return result == 0
+}
+
+// ==================== Phase 2: Rolling Shutter Correction ====================
+
+/**
+ * Configuration for rolling shutter correction
+ */
+data class RollingShutterConfig(
+    val readoutTimeMs: Float = 33.0f,     // Frame readout time (ms)
+    val focalLengthPx: Float = 3000.0f    // Focal length in pixels
+)
+
+/**
+ * Gyro sample for rolling shutter correction
+ */
+data class GyroSampleRS(
+    val timestamp: Float,                 // Time in seconds
+    val rotX: Float,                      // Angular velocity X (rad/s)
+    val rotY: Float,                      // Angular velocity Y (rad/s)
+    val rotZ: Float                       // Angular velocity Z (rad/s)
+)
+
+/**
+ * Correct rolling shutter distortion using gyro data
+ * 
+ * @param input Input bitmap with RS distortion
+ * @param output Output bitmap (same size)
+ * @param gyroSamples Gyroscope samples during exposure
+ * @param config Rolling shutter configuration
+ * @return true on success
+ */
+fun correctRollingShutter(
+    input: Bitmap,
+    output: Bitmap,
+    gyroSamples: List<GyroSampleRS>,
+    config: RollingShutterConfig = RollingShutterConfig()
+): Boolean {
+    // Flatten gyro data [t0, rx0, ry0, rz0, t1, rx1, ...]
+    val gyroArray = FloatArray(gyroSamples.size * 4)
+    gyroSamples.forEachIndexed { i, sample ->
+        gyroArray[i * 4] = sample.timestamp
+        gyroArray[i * 4 + 1] = sample.rotX
+        gyroArray[i * 4 + 2] = sample.rotY
+        gyroArray[i * 4 + 3] = sample.rotZ
+    }
+    
+    val result = NativeMFSRPipeline.nativeCorrectRollingShutter(
+        input, output, gyroArray,
+        config.readoutTimeMs, config.focalLengthPx
+    )
+    return result == 0
+}
+
+// ==================== Phase 3: Kalman Fusion ====================
+
+/**
+ * Configuration for Kalman fusion
+ */
+data class KalmanFusionConfig(
+    val gyroWeight: Float = 0.7f,         // Weight for gyro measurements
+    val flowWeight: Float = 0.3f          // Weight for optical flow
+)
+
+/**
+ * Gyro measurement for Kalman fusion
+ */
+data class GyroMeasurementKF(
+    val timestamp: Float,                 // Time in seconds
+    val rotX: Float,                      // Angular velocity X (rad/s)
+    val rotY: Float,                      // Angular velocity Y (rad/s)
+    val rotZ: Float,                      // Angular velocity Z (rad/s)
+    val dt: Float                         // Time delta from previous
+)
+
+/**
+ * Optical flow measurement for Kalman fusion
+ */
+data class FlowMeasurementKF(
+    val dx: Float,                        // X displacement (pixels)
+    val dy: Float,                        // Y displacement (pixels)
+    val confidence: Float = 1.0f          // Measurement confidence
+)
+
+/**
+ * Fused motion result
+ */
+data class FusedMotion(
+    val x: Float,                         // Position X
+    val y: Float,                         // Position Y
+    val vx: Float,                        // Velocity X
+    val vy: Float,                        // Velocity Y
+    val uncertainty: Float                // Motion uncertainty
+)
+
+/**
+ * Fuse gyro and optical flow using Kalman filter
+ * 
+ * @param gyroSamples All gyro samples across frames
+ * @param flowMeasurements Optical flow between frame pairs
+ * @param numFrames Number of frames
+ * @param config Kalman fusion configuration
+ * @return List of fused motion estimates
+ */
+fun kalmanFusion(
+    gyroSamples: List<GyroMeasurementKF>,
+    flowMeasurements: List<FlowMeasurementKF>,
+    numFrames: Int,
+    config: KalmanFusionConfig = KalmanFusionConfig()
+): List<FusedMotion> {
+    if (flowMeasurements.isEmpty()) return emptyList()
+    
+    // Flatten gyro data [t, rx, ry, rz, dt, ...]
+    val gyroArray = FloatArray(gyroSamples.size * 5)
+    gyroSamples.forEachIndexed { i, sample ->
+        gyroArray[i * 5] = sample.timestamp
+        gyroArray[i * 5 + 1] = sample.rotX
+        gyroArray[i * 5 + 2] = sample.rotY
+        gyroArray[i * 5 + 3] = sample.rotZ
+        gyroArray[i * 5 + 4] = sample.dt
+    }
+    
+    // Flatten flow data [dx, dy, confidence, ...]
+    val flowArray = FloatArray(flowMeasurements.size * 3)
+    flowMeasurements.forEachIndexed { i, flow ->
+        flowArray[i * 3] = flow.dx
+        flowArray[i * 3 + 1] = flow.dy
+        flowArray[i * 3 + 2] = flow.confidence
+    }
+    
+    // Output array [x, y, vx, vy, uncertainty, ...]
+    val outputArray = FloatArray(flowMeasurements.size * 5)
+    
+    val count = NativeMFSRPipeline.nativeKalmanFusion(
+        gyroArray, flowArray, numFrames, outputArray,
+        config.gyroWeight, config.flowWeight
+    )
+    
+    if (count <= 0) return emptyList()
+    
+    return (0 until count).map { i ->
+        FusedMotion(
+            x = outputArray[i * 5],
+            y = outputArray[i * 5 + 1],
+            vx = outputArray[i * 5 + 2],
+            vy = outputArray[i * 5 + 3],
+            uncertainty = outputArray[i * 5 + 4]
+        )
+    }
+}
+
+// ==================== Phase 3: Texture Synthesis ====================
+
+/**
+ * Configuration for texture synthesis
+ */
+data class TextureSynthConfig(
+    val patchSize: Int = 7,               // Synthesis patch size
+    val searchRadius: Int = 32,           // Search radius for patches
+    val blendWeight: Float = 0.5f         // Blend weight for detail
+)
+
+/**
+ * Synthesize texture details for an image
+ * 
+ * @param input Input bitmap (potentially lacking detail)
+ * @param output Output bitmap with synthesized details
+ * @param config Texture synthesis configuration
+ * @return true on success
+ */
+fun synthesizeTexture(
+    input: Bitmap,
+    output: Bitmap,
+    config: TextureSynthConfig = TextureSynthConfig()
+): Boolean {
+    val result = NativeMFSRPipeline.nativeTextureSynthesis(
+        input, output,
+        config.patchSize, config.searchRadius, config.blendWeight
+    )
+    return result == 0
+}
+
+/**
+ * Transfer texture from source to target regions
+ * 
+ * @param target Target bitmap to enhance
+ * @param source Source bitmap with texture
+ * @param mask Mask indicating where to transfer (0-1 per pixel)
+ * @param output Output enhanced bitmap
+ * @param blendWeight Blend weight
+ * @return true on success
+ */
+fun transferTexture(
+    target: Bitmap,
+    source: Bitmap,
+    mask: FloatArray,
+    output: Bitmap,
+    blendWeight: Float = 0.5f
+): Boolean {
+    val result = NativeMFSRPipeline.nativeTextureTransfer(
+        target, source, mask, output, blendWeight
+    )
+    return result == 0
 }

@@ -35,6 +35,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import kotlinx.coroutines.yield
 import kotlin.math.ceil
 import kotlin.math.min
 
@@ -373,6 +374,8 @@ class MFSRRefiner(
         Log.d(TAG, "Processing ${tilesX}x${tilesY} = $totalTiles tiles")
         
         var tilesProcessed = 0
+        var tilesSkipped = 0
+        var lastProgressUpdate = System.currentTimeMillis()
         
         for (ty in 0 until tilesY) {
             for (tx in 0 until tilesX) {
@@ -384,25 +387,11 @@ class MFSRRefiner(
                 val tileWidth = srcRight - srcX
                 val tileHeight = srcBottom - srcY
                 
-                // Process tile through ESRGAN
-                val upscaledTile = processTile(input, srcX, srcY, tileWidth, tileHeight)
+                // Check if this is a pure-padding edge tile (skip processing)
+                val isPaddingTile = isPurePaddingTile(input, srcX, srcY, tileWidth, tileHeight)
                 
-                if (upscaledTile != null) {
-                    // Calculate destination in output space (scaled by modelScaleFactor)
-                    val dstX = srcX * modelScaleFactor
-                    val dstY = srcY * modelScaleFactor
-                    
-                    // Draw upscaled tile
-                    canvas.drawBitmap(
-                        upscaledTile,
-                        Rect(0, 0, upscaledTile.width, upscaledTile.height),
-                        Rect(dstX, dstY, dstX + upscaledTile.width, dstY + upscaledTile.height),
-                        paint
-                    )
-                    
-                    upscaledTile.recycle()
-                } else {
-                    // Fallback: bilinear upscale of original region
+                if (isPaddingTile) {
+                    // Skip processing - just fill with bilinear upscale
                     val dstX = srcX * modelScaleFactor
                     val dstY = srcY * modelScaleFactor
                     val dstWidth = tileWidth * modelScaleFactor
@@ -414,16 +403,108 @@ class MFSRRefiner(
                         Rect(dstX, dstY, dstX + dstWidth, dstY + dstHeight),
                         paint
                     )
+                    tilesSkipped++
+                } else {
+                    // Process tile through ESRGAN
+                    val upscaledTile = processTile(input, srcX, srcY, tileWidth, tileHeight)
+                    
+                    if (upscaledTile != null) {
+                        // Calculate destination in output space (scaled by modelScaleFactor)
+                        val dstX = srcX * modelScaleFactor
+                        val dstY = srcY * modelScaleFactor
+                        
+                        // Draw upscaled tile
+                        canvas.drawBitmap(
+                            upscaledTile,
+                            Rect(0, 0, upscaledTile.width, upscaledTile.height),
+                            Rect(dstX, dstY, dstX + upscaledTile.width, dstY + upscaledTile.height),
+                            paint
+                        )
+                        
+                        upscaledTile.recycle()
+                    } else {
+                        // Fallback: bilinear upscale of original region
+                        val dstX = srcX * modelScaleFactor
+                        val dstY = srcY * modelScaleFactor
+                        val dstWidth = tileWidth * modelScaleFactor
+                        val dstHeight = tileHeight * modelScaleFactor
+                        
+                        canvas.drawBitmap(
+                            input,
+                            Rect(srcX, srcY, srcRight, srcBottom),
+                            Rect(dstX, dstY, dstX + dstWidth, dstY + dstHeight),
+                            paint
+                        )
+                    }
                 }
                 
                 tilesProcessed++
-                progressCallback?.invoke(tilesProcessed, totalTiles, "ESRGAN tile $tilesProcessed/$totalTiles")
+                
+                // Throttle progress updates to reduce main thread load (max 10 updates/sec)
+                val now = System.currentTimeMillis()
+                if (now - lastProgressUpdate >= 100 || tilesProcessed == totalTiles) {
+                    progressCallback?.invoke(tilesProcessed, totalTiles, "ESRGAN tile $tilesProcessed/$totalTiles")
+                    lastProgressUpdate = now
+                    // Yield to allow UI updates and prevent ANR
+                    yield()
+                }
             }
         }
         
         val outputMP = (outputWidth.toLong() * outputHeight) / 1_000_000f
-        Log.i(TAG, "ESRGAN upscale complete: ${outputWidth}x${outputHeight} (${"%,.1f".format(outputMP)}MP)")
+        Log.i(TAG, "ESRGAN upscale complete: ${outputWidth}x${outputHeight} (${"%.1f".format(outputMP)}MP), skipped $tilesSkipped padding tiles")
         output
+    }
+    
+    /**
+     * Check if a tile is pure padding (uniform color or very low variance)
+     * These tiles don't benefit from neural upscaling and can be skipped
+     */
+    private fun isPurePaddingTile(
+        input: Bitmap,
+        srcX: Int,
+        srcY: Int,
+        tileWidth: Int,
+        tileHeight: Int
+    ): Boolean {
+        // Sample a few pixels to check for uniformity
+        val sampleCount = 9 // 3x3 grid
+        val pixels = IntArray(sampleCount)
+        
+        val stepX = maxOf(1, tileWidth / 3)
+        val stepY = maxOf(1, tileHeight / 3)
+        
+        var idx = 0
+        for (sy in 0 until 3) {
+            for (sx in 0 until 3) {
+                val px = minOf(srcX + sx * stepX, input.width - 1)
+                val py = minOf(srcY + sy * stepY, input.height - 1)
+                pixels[idx++] = input.getPixel(px, py)
+            }
+        }
+        
+        // Check if all sampled pixels are nearly identical (variance < threshold)
+        val firstPixel = pixels[0]
+        val firstR = (firstPixel shr 16) and 0xFF
+        val firstG = (firstPixel shr 8) and 0xFF
+        val firstB = firstPixel and 0xFF
+        
+        var maxDiff = 0
+        for (pixel in pixels) {
+            val r = (pixel shr 16) and 0xFF
+            val g = (pixel shr 8) and 0xFF
+            val b = pixel and 0xFF
+            
+            val diff = maxOf(
+                kotlin.math.abs(r - firstR),
+                kotlin.math.abs(g - firstG),
+                kotlin.math.abs(b - firstB)
+            )
+            maxDiff = maxOf(maxDiff, diff)
+        }
+        
+        // If max color difference is < 5, consider it a padding tile
+        return maxDiff < 5
     }
     
     /**
