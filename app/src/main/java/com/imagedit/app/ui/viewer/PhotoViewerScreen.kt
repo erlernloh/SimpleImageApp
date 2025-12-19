@@ -395,10 +395,13 @@ private fun ZoomableImage(
         AsyncImage(
             model = ImageRequest.Builder(context)
                 .data(Uri.parse(photoUri))
-                .size(coil.size.Size.ORIGINAL) // Load full resolution for pixel-level zoom
+                // Limit max size to prevent OOM on very large images (e.g., 71MP ULTRA output)
+                // 4096x4096 is a safe limit for most devices while still allowing good zoom
+                .size(4096, 4096)
                 .crossfade(true)
                 .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
                 .diskCachePolicy(coil.request.CachePolicy.ENABLED)
+                .allowHardware(false) // Disable hardware bitmaps for large images to prevent crashes
                 .listener(
                     onSuccess = { _, result ->
                         // Get actual image dimensions

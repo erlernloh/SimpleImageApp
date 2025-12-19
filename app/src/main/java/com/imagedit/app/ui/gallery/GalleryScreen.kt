@@ -763,7 +763,7 @@ private fun PhotoGridItem(
                     .diskCacheKey("${photo.id}_thumb") // Stable disk cache key
                     .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
                     .diskCachePolicy(coil.request.CachePolicy.ENABLED)
-                    .allowHardware(true)
+                    .allowHardware(false) // Disable hardware bitmaps to prevent crashes on large images
                     .build(),
                 contentDescription = null,
                 modifier = Modifier
