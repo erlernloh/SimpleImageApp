@@ -3,35 +3,23 @@ package com.imagedit.app.ui.viewer
 import android.content.ContentResolver
 import android.net.Uri
 import android.provider.MediaStore
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
+import androidx.compose.ui.viewinterop.AndroidView
+import com.davemorrissey.labs.subscaleview.ImageSource
+import com.davemorrissey.labs.subscaleview.SubsamplingScaleImageView
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -307,8 +295,9 @@ private fun formatFileSize(bytes: Long): String {
 }
 
 /**
- * Zoomable image composable with pinch-to-zoom and pan support.
- * Allows zooming up to see individual pixels for larger images.
+ * Zoomable image composable using SubsamplingScaleImageView for full resolution viewing.
+ * Uses tile-based loading to handle very large images (e.g., 71MP ULTRA output) without OOM.
+ * Supports pinch-to-zoom and double-tap to zoom.
  */
 @Composable
 private fun ZoomableImage(
@@ -316,116 +305,55 @@ private fun ZoomableImage(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    
-    // Zoom and pan state
-    var scale by remember { mutableFloatStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
-    var containerSize by remember { mutableStateOf(IntSize.Zero) }
-    
-    // Calculate max zoom based on image size - larger images can zoom more
-    var imageSize by remember { mutableStateOf(IntSize.Zero) }
-    val minScale = 1f
-    // Allow zooming up to see pixels: max zoom = max(image dimension / container dimension, 10x)
-    val maxScale by remember(imageSize, containerSize) {
-        derivedStateOf {
-            if (containerSize.width > 0 && containerSize.height > 0 && imageSize.width > 0) {
-                val scaleToPixel = maxOf(
-                    imageSize.width.toFloat() / containerSize.width,
-                    imageSize.height.toFloat() / containerSize.height
-                )
-                // Allow at least 5x zoom, up to pixel-level zoom (capped at 20x for performance)
-                maxOf(5f, minOf(scaleToPixel * 2f, 20f))
-            } else {
-                10f
-            }
-        }
-    }
+    var currentScale by remember { mutableFloatStateOf(1f) }
     
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
-            .onSizeChanged { containerSize = it }
-            .pointerInput(Unit) {
-                detectTransformGestures { centroid, pan, zoom, _ ->
-                    // Update scale with bounds
-                    val newScale = (scale * zoom).coerceIn(minScale, maxScale)
-                    
-                    // Calculate new offset to zoom towards the centroid
-                    val scaleDiff = newScale / scale
-                    val newOffset = Offset(
-                        x = (offset.x * scaleDiff) + (centroid.x * (1 - scaleDiff)) + (pan.x * newScale),
-                        y = (offset.y * scaleDiff) + (centroid.y * (1 - scaleDiff)) + (pan.y * newScale)
-                    )
-                    
-                    // Constrain offset to keep image in bounds
-                    val maxOffsetX = (containerSize.width * (newScale - 1) / 2).coerceAtLeast(0f)
-                    val maxOffsetY = (containerSize.height * (newScale - 1) / 2).coerceAtLeast(0f)
-                    
-                    scale = newScale
-                    offset = Offset(
-                        x = newOffset.x.coerceIn(-maxOffsetX, maxOffsetX),
-                        y = newOffset.y.coerceIn(-maxOffsetY, maxOffsetY)
-                    )
-                }
-            }
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onDoubleTap = { tapOffset ->
-                        // Double tap to toggle between 1x and 3x zoom
-                        if (scale > 1.5f) {
-                            // Reset to 1x
-                            scale = 1f
-                            offset = Offset.Zero
-                        } else {
-                            // Zoom to 3x centered on tap point
-                            scale = 3f
-                            val centerX = containerSize.width / 2f
-                            val centerY = containerSize.height / 2f
-                            offset = Offset(
-                                x = (centerX - tapOffset.x) * 2f,
-                                y = (centerY - tapOffset.y) * 2f
-                            )
-                        }
-                    }
-                )
-            },
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)),
         contentAlignment = Alignment.Center
     ) {
-        AsyncImage(
-            model = ImageRequest.Builder(context)
-                .data(Uri.parse(photoUri))
-                // Limit max size to prevent OOM on very large images (e.g., 71MP ULTRA output)
-                // 4096x4096 is a safe limit for most devices while still allowing good zoom
-                .size(4096, 4096)
-                .crossfade(true)
-                .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
-                .diskCachePolicy(coil.request.CachePolicy.ENABLED)
-                .allowHardware(false) // Disable hardware bitmaps for large images to prevent crashes
-                .listener(
-                    onSuccess = { _, result ->
-                        // Get actual image dimensions
-                        imageSize = IntSize(
-                            result.drawable.intrinsicWidth,
-                            result.drawable.intrinsicHeight
-                        )
-                    }
-                )
-                .build(),
-            contentDescription = "Photo (pinch to zoom, double-tap to toggle zoom)",
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer {
-                    scaleX = scale
-                    scaleY = scale
-                    translationX = offset.x
-                    translationY = offset.y
-                },
-            contentScale = ContentScale.Fit
+        // Use SubsamplingScaleImageView for efficient large image viewing
+        // It loads tiles on-demand, allowing full resolution zoom without OOM
+        AndroidView(
+            factory = { ctx ->
+                SubsamplingScaleImageView(ctx).apply {
+                    // Configure for optimal viewing
+                    setMinimumScaleType(SubsamplingScaleImageView.SCALE_TYPE_CENTER_INSIDE)
+                    setDoubleTapZoomStyle(SubsamplingScaleImageView.ZOOM_FOCUS_CENTER_IMMEDIATE)
+                    setDoubleTapZoomDuration(300)
+                    setPanLimit(SubsamplingScaleImageView.PAN_LIMIT_INSIDE)
+                    
+                    // Set max scale to allow pixel-level zoom (will be adjusted based on image size)
+                    maxScale = 10f
+                    
+                    // Enable quick scale (pinch zoom)
+                    isQuickScaleEnabled = true
+                    
+                    // Set double tap zoom scales
+                    setDoubleTapZoomScale(3f)
+                    
+                    // Listen for scale changes to update the zoom indicator
+                    setOnStateChangedListener(object : SubsamplingScaleImageView.OnStateChangedListener {
+                        override fun onScaleChanged(newScale: Float, origin: Int) {
+                            currentScale = newScale
+                        }
+                        override fun onCenterChanged(newCenter: android.graphics.PointF?, origin: Int) {}
+                    })
+                    
+                    // Load the image
+                    setImage(ImageSource.uri(photoUri))
+                }
+            },
+            modifier = Modifier.fillMaxSize(),
+            update = { view ->
+                // Update image if URI changes
+                view.setImage(ImageSource.uri(photoUri))
+            }
         )
         
         // Zoom indicator (shows when zoomed)
-        if (scale > 1.1f) {
+        if (currentScale > 1.1f) {
             Surface(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
@@ -434,7 +362,7 @@ private fun ZoomableImage(
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.8f)
             ) {
                 Text(
-                    text = "${String.format("%.1f", scale)}x",
+                    text = "${String.format("%.1f", currentScale)}x",
                     style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     color = MaterialTheme.colorScheme.onSurface

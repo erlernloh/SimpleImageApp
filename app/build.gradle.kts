@@ -147,6 +147,9 @@ dependencies {
     // Gson for JSON parsing
     implementation("com.google.code.gson:gson:2.10.1")
     
+    // Subsampling Scale Image View for large image viewing without OOM
+    implementation("com.davemorrissey.labs:subsampling-scale-image-view-androidx:3.10.0")
+    
     // LeakCanary for memory leak detection (debug builds only)
     debugImplementation("com.squareup.leakcanary:leakcanary-android:2.12")
     
