@@ -501,7 +501,7 @@ private fun PresetSelector(
                 text = {
                     Column {
                         Text("🚀 Ultra Resolution", fontWeight = FontWeight.Bold)
-                        Text("2× larger + AI polish • 10 HQ photos (~4s capture)", 
+                        Text("2× MFSR + Drizzle + Detail Enhancement • 10 HQ photos", 
                             style = MaterialTheme.typography.bodySmall, 
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -667,6 +667,17 @@ private fun CaptureControls(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
                     )
+                    
+                    // Show detailed status message from pipeline
+                    if (statusMessage.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = statusMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                            textAlign = TextAlign.Center
+                        )
+                    }
                     
                     Spacer(modifier = Modifier.height(8.dp))
                     

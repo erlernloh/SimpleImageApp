@@ -805,9 +805,21 @@ class UltraDetailViewModel @Inject constructor(
     private fun handlePipelineState(state: PipelineState) {
         when (state) {
             is PipelineState.ProcessingBurst -> {
+                // Map pipeline stage to UI stage based on the actual processing stage
+                val uiStage = when (state.stage) {
+                    ProcessingStage.CONVERTING_YUV,
+                    ProcessingStage.BUILDING_PYRAMIDS,
+                    ProcessingStage.ALIGNING_FRAMES -> UiProcessingStage.ALIGNING
+                    ProcessingStage.MERGING_FRAMES,
+                    ProcessingStage.COMPUTING_EDGES,
+                    ProcessingStage.GENERATING_MASK -> UiProcessingStage.REFINING
+                    ProcessingStage.MULTI_FRAME_SR -> UiProcessingStage.SUPER_RESOLUTION
+                    ProcessingStage.COMPLETE -> UiProcessingStage.FINALIZING
+                    else -> UiProcessingStage.ALIGNING
+                }
                 _uiState.value = _uiState.value.copy(
                     processingProgress = state.progress,
-                    processingStage = UiProcessingStage.ALIGNING,
+                    processingStage = uiStage,
                     statusMessage = state.message
                 )
             }
