@@ -118,8 +118,8 @@ class UltraDetailViewModel @Inject constructor(
                     Log.d(TAG, "RAW capture not supported on this device")
                 }
                 
-                // Observe pipeline state
-                launch {
+                // Observe pipeline state on main thread for UI updates
+                launch(Dispatchers.Main) {
                     pipeline?.state?.collect { state ->
                         handlePipelineState(state)
                     }

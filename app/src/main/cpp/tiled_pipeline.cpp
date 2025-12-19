@@ -819,7 +819,7 @@ void TiledMFSRPipeline::process(
     // Post-processing: Edge-preserving smoothing to remove blotchy artifacts
     // Uses a simplified bilateral filter approach similar to Google's HDR+
     if (progressCallback) {
-        progressCallback(totalTiles, totalTiles, "Smoothing artifacts", 0.95f);
+        progressCallback(totalTiles, totalTiles, "Smoothing artifacts", 0.90f);
     }
     
     // Create a copy for filtering
@@ -831,7 +831,17 @@ void TiledMFSRPipeline::process(
     const float spatialSigma = 2.5f;   // Wider spatial kernel (was 1.5)
     const float rangeSigma = 0.15f;    // More tolerant of color variation (was 0.08)
     
+    int lastProgressRow = 0;
+    const int progressInterval = outHeight / 20;  // Update every 5%
+    
     for (int y = filterRadius; y < outHeight - filterRadius; ++y) {
+        // Report progress during smoothing (90-95%)
+        if (progressCallback && (y - lastProgressRow) >= progressInterval) {
+            float smoothProgress = 0.90f + 0.05f * (static_cast<float>(y) / outHeight);
+            progressCallback(totalTiles, totalTiles, "Smoothing", smoothProgress);
+            lastProgressRow = y;
+        }
+        
         for (int x = filterRadius; x < outWidth - filterRadius; ++x) {
             const RGBPixel& center = result.outputImage.at(x, y);
             
@@ -883,7 +893,7 @@ void TiledMFSRPipeline::process(
     // Post-processing: Unsharp Mask (USM) sharpening to restore detail
     // This is essential for MFSR output which tends to be soft due to averaging
     if (progressCallback) {
-        progressCallback(totalTiles, totalTiles, "Sharpening", 0.98f);
+        progressCallback(totalTiles, totalTiles, "Sharpening", 0.95f);
     }
     
     // USM parameters tuned for MFSR output
@@ -893,7 +903,15 @@ void TiledMFSRPipeline::process(
     
     // Create blurred version for USM (simple box blur for speed)
     RGBImage blurred(outWidth, outHeight);
+    lastProgressRow = 0;
     for (int y = usmRadius; y < outHeight - usmRadius; ++y) {
+        // Report progress during blur pass (95-97%)
+        if (progressCallback && (y - lastProgressRow) >= progressInterval) {
+            float blurProgress = 0.95f + 0.02f * (static_cast<float>(y) / outHeight);
+            progressCallback(totalTiles, totalTiles, "Sharpening", blurProgress);
+            lastProgressRow = y;
+        }
+        
         for (int x = usmRadius; x < outWidth - usmRadius; ++x) {
             float sumR = 0, sumG = 0, sumB = 0;
             int count = 0;
@@ -911,7 +929,15 @@ void TiledMFSRPipeline::process(
     }
     
     // Apply USM: sharpened = original + amount * (original - blurred)
+    lastProgressRow = 0;
     for (int y = usmRadius; y < outHeight - usmRadius; ++y) {
+        // Report progress during USM apply (97-99%)
+        if (progressCallback && (y - lastProgressRow) >= progressInterval) {
+            float usmProgress = 0.97f + 0.02f * (static_cast<float>(y) / outHeight);
+            progressCallback(totalTiles, totalTiles, "Finalizing", usmProgress);
+            lastProgressRow = y;
+        }
+        
         for (int x = usmRadius; x < outWidth - usmRadius; ++x) {
             RGBPixel& p = result.outputImage.at(x, y);
             const RGBPixel& b = blurred.at(x, y);

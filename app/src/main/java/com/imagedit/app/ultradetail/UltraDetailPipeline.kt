@@ -791,10 +791,24 @@ class UltraDetailPipeline(
             maskHeight = qualityResult.height,
             outputBitmap = outputBitmap,
             progressCallback = object : MFSRProgressCallback {
+                private var lastUpdateTime = 0L
+                private var lastProgress = -1f
+                
                 override fun onProgress(tilesProcessed: Int, totalTiles: Int, message: String, progress: Float) {
-                    _state.value = PipelineState.ProcessingMFSR(tilesProcessed, totalTiles, progress)
-                    if (tilesProcessed == totalTiles || tilesProcessed % 3 == 0) {
-                        Log.d(TAG, "║   - MFSR tile progress: $tilesProcessed/$totalTiles (${"%.0f".format(progress * 100)}%)")
+                    val now = System.currentTimeMillis()
+                    // Throttle updates to max 10/sec to prevent UI thread overload
+                    // Always update on significant progress changes (>2%) or completion
+                    val significantChange = kotlin.math.abs(progress - lastProgress) >= 0.02f
+                    val shouldUpdate = (now - lastUpdateTime >= 100) || significantChange || progress >= 0.99f
+                    
+                    if (shouldUpdate) {
+                        _state.value = PipelineState.ProcessingMFSR(tilesProcessed, totalTiles, progress)
+                        lastUpdateTime = now
+                        lastProgress = progress
+                        
+                        if (tilesProcessed == totalTiles || tilesProcessed % 5 == 0 || progress >= 0.9f) {
+                            Log.d(TAG, "║   - MFSR progress: $tilesProcessed/$totalTiles (${"%.0f".format(progress * 100)}%) - $message")
+                        }
                     }
                 }
             }
