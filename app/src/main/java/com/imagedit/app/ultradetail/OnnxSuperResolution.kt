@@ -69,7 +69,8 @@ data class OnnxSRConfig(
     val tileSize: Int = model.recommendedTileSize,
     val overlap: Int = 16,
     val useGpu: Boolean = true,
-    val numThreads: Int = 4
+    val numThreads: Int = 4,
+    val modelFilePath: String? = null  // Optional: load from file instead of assets
 )
 
 /**
@@ -96,10 +97,15 @@ class OnnxSuperResolution(
             // Create ONNX Runtime environment
             ortEnv = OrtEnvironment.getEnvironment()
             
-            // Load model from assets
-            val modelBytes = loadModelFromAssets(config.model.assetPath)
+            // Load model from file or assets
+            val modelBytes = if (config.modelFilePath != null) {
+                loadModelFromFile(config.modelFilePath)
+            } else {
+                loadModelFromAssets(config.model.assetPath)
+            }
+            
             if (modelBytes == null) {
-                Log.e(TAG, "Failed to load model: ${config.model.assetPath}")
+                Log.e(TAG, "Failed to load model: ${config.modelFilePath ?: config.model.assetPath}")
                 return@withContext false
             }
             
@@ -402,6 +408,23 @@ class OnnxSuperResolution(
         output.setPixels(outputPixels, 0, tileWidth, x, y,
             min(tileWidth, outputWidth - x),
             min(tileHeight, outputHeight - y))
+    }
+    
+    /**
+     * Load model from file system
+     */
+    private fun loadModelFromFile(filePath: String): ByteArray? {
+        return try {
+            val file = java.io.File(filePath)
+            if (!file.exists()) {
+                Log.e(TAG, "Model file not found: $filePath")
+                return null
+            }
+            file.readBytes()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load model from file: $filePath", e)
+            null
+        }
     }
     
     /**

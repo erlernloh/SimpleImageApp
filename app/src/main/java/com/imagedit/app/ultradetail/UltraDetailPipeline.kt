@@ -169,27 +169,60 @@ class UltraDetailPipeline(
                 if (preset == UltraDetailPreset.ULTRA) {
                     // Try ONNX-based Real-ESRGAN first (better quality)
                     var onnxInitialized = false
-                    try {
-                        onnxSR = OnnxSuperResolution(context, OnnxSRConfig(
-                            model = OnnxSRModel.REAL_ESRGAN_X4,
-                            tileSize = 256,
-                            overlap = 16,
-                            useGpu = true,
-                            numThreads = 4
-                        ))
-                        
-                        if (onnxSR!!.initialize()) {
-                            onnxInitialized = true
-                            Log.i(TAG, "ONNX Real-ESRGAN initialized successfully")
-                        } else {
-                            Log.w(TAG, "ONNX Real-ESRGAN initialization failed, falling back to TFLite")
+                    
+                    // Check if model is downloaded
+                    val modelDownloader = ModelDownloader(context)
+                    val modelPath = modelDownloader.getModelPath(AvailableModels.REAL_ESRGAN_X4_FP16)
+                    
+                    if (modelPath != null) {
+                        // Model is downloaded, use it
+                        try {
+                            onnxSR = OnnxSuperResolution(context, OnnxSRConfig(
+                                model = OnnxSRModel.REAL_ESRGAN_X4,
+                                tileSize = 256,
+                                overlap = 16,
+                                useGpu = true,
+                                numThreads = 4,
+                                modelFilePath = modelPath
+                            ))
+                            
+                            if (onnxSR!!.initialize()) {
+                                onnxInitialized = true
+                                Log.i(TAG, "ONNX Real-ESRGAN initialized from downloaded model: $modelPath")
+                            } else {
+                                Log.w(TAG, "ONNX Real-ESRGAN initialization failed, falling back to TFLite")
+                                onnxSR?.close()
+                                onnxSR = null
+                            }
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "ONNX Real-ESRGAN failed: ${e.message}, falling back to TFLite")
                             onnxSR?.close()
                             onnxSR = null
                         }
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "ONNX Real-ESRGAN not available: ${e.message}, falling back to TFLite")
-                        onnxSR?.close()
-                        onnxSR = null
+                    } else {
+                        // Model not downloaded, try loading from assets (if bundled)
+                        try {
+                            onnxSR = OnnxSuperResolution(context, OnnxSRConfig(
+                                model = OnnxSRModel.REAL_ESRGAN_X4,
+                                tileSize = 256,
+                                overlap = 16,
+                                useGpu = true,
+                                numThreads = 4
+                            ))
+                            
+                            if (onnxSR!!.initialize()) {
+                                onnxInitialized = true
+                                Log.i(TAG, "ONNX Real-ESRGAN initialized from assets")
+                            } else {
+                                Log.i(TAG, "ONNX Real-ESRGAN not available (model not downloaded)")
+                                onnxSR?.close()
+                                onnxSR = null
+                            }
+                        } catch (e: Throwable) {
+                            Log.i(TAG, "ONNX Real-ESRGAN not available: ${e.message}")
+                            onnxSR?.close()
+                            onnxSR = null
+                        }
                     }
                     
                     // Fall back to TFLite ESRGAN if ONNX not available

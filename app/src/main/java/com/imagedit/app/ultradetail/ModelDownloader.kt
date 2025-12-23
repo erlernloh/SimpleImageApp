@@ -42,19 +42,30 @@ data class ModelInfo(
     val fileName: String,
     val downloadUrl: String,
     val expectedSizeBytes: Long,
-    val description: String
+    val description: String,
+    val runtime: ModelRuntime = ModelRuntime.TFLITE
 )
+
+/**
+ * Model type for different runtimes
+ */
+enum class ModelRuntime {
+    TFLITE,  // TensorFlow Lite models
+    ONNX     // ONNX Runtime models
+}
 
 /**
  * Available models for download
  */
 object AvailableModels {
+    // TFLite models (legacy)
     val ESRGAN_FP16 = ModelInfo(
         name = "ESRGAN Super-Resolution (Float16)",
         fileName = "esrgan.tflite",
         downloadUrl = "https://github.com/margaretmz/esrgan-e2e-tflite-tutorial/releases/download/v0.1.0/esrgan_fp16.tar.gz",
         expectedSizeBytes = 20_000_000L, // ~20MB compressed
-        description = "High-quality 4x upscaling model. Downloads ~20MB."
+        description = "High-quality 4x upscaling model. Downloads ~20MB.",
+        runtime = ModelRuntime.TFLITE
     )
     
     val ESRGAN_INT8 = ModelInfo(
@@ -62,7 +73,37 @@ object AvailableModels {
         fileName = "esrgan.tflite",
         downloadUrl = "https://github.com/margaretmz/esrgan-e2e-tflite-tutorial/releases/download/v0.1.0/esrgan_int8.tar.gz",
         expectedSizeBytes = 5_000_000L, // ~5MB compressed
-        description = "Faster 4x upscaling model. Downloads ~5MB."
+        description = "Faster 4x upscaling model. Downloads ~5MB.",
+        runtime = ModelRuntime.TFLITE
+    )
+    
+    // ONNX models (Real-ESRGAN)
+    // TODO: Replace with your actual hosting URL (GitHub Releases, CDN, etc.)
+    val REAL_ESRGAN_X4_FP16 = ModelInfo(
+        name = "Real-ESRGAN x4plus (FP16)",
+        fileName = "realesrgan_x4plus_fp16.onnx",
+        downloadUrl = "https://github.com/YOUR_USERNAME/YOUR_REPO/releases/download/v1.0.0/realesrgan_x4plus_fp16.onnx",
+        expectedSizeBytes = 33_000_000L, // ~33MB
+        description = "Best quality 4x upscaling. Downloads ~33MB.",
+        runtime = ModelRuntime.ONNX
+    )
+    
+    val REAL_ESRGAN_X4_ANIME_FP16 = ModelInfo(
+        name = "Real-ESRGAN x4plus Anime (FP16)",
+        fileName = "realesrgan_x4plus_anime_fp16.onnx",
+        downloadUrl = "https://github.com/YOUR_USERNAME/YOUR_REPO/releases/download/v1.0.0/realesrgan_x4plus_anime_fp16.onnx",
+        expectedSizeBytes = 33_000_000L, // ~33MB
+        description = "Sharper 4x upscaling for anime/illustrations. Downloads ~33MB.",
+        runtime = ModelRuntime.ONNX
+    )
+    
+    val SWINIR_X4_FP16 = ModelInfo(
+        name = "SwinIR x4 (FP16)",
+        fileName = "swinir_x4_fp16.onnx",
+        downloadUrl = "https://github.com/YOUR_USERNAME/YOUR_REPO/releases/download/v1.0.0/swinir_x4_fp16.onnx",
+        expectedSizeBytes = 12_000_000L, // ~12MB
+        description = "Transformer-based SR. Downloads ~12MB.",
+        runtime = ModelRuntime.ONNX
     )
 }
 
@@ -102,11 +143,25 @@ class ModelDownloader(private val context: Context) {
         emit(DownloadState.Checking)
         
         try {
-            val tempFile = File(context.cacheDir, "model_download.tar.gz")
             val targetFile = File(modelsDir, model.fileName)
             
-            // Download the compressed file
-            Log.i(TAG, "Downloading model from: ${model.downloadUrl}")
+            // Check if already downloaded
+            if (targetFile.exists() && targetFile.length() > 100_000) {
+                Log.i(TAG, "Model already exists: ${targetFile.absolutePath}")
+                emit(DownloadState.Complete)
+                return@flow
+            }
+            
+            // Determine if file is compressed based on URL
+            val isCompressed = model.downloadUrl.endsWith(".tar.gz") || model.downloadUrl.endsWith(".gz")
+            val tempFile = if (isCompressed) {
+                File(context.cacheDir, "model_download.tar.gz")
+            } else {
+                File(context.cacheDir, "model_download.tmp")
+            }
+            
+            // Download the file
+            Log.i(TAG, "Downloading ${model.name} from: ${model.downloadUrl}")
             
             val url = URL(model.downloadUrl)
             val connection = url.openConnection() as HttpURLConnection
@@ -161,25 +216,32 @@ class ModelDownloader(private val context: Context) {
             
             finalConnection.disconnect()
             
-            Log.i(TAG, "Download complete, extracting...")
-            emit(DownloadState.Extracting)
+            // Process based on file type
+            if (isCompressed) {
+                Log.i(TAG, "Download complete, extracting...")
+                emit(DownloadState.Extracting)
+                
+                // Extract the tar.gz file (for TFLite models)
+                extractTarGz(tempFile, modelsDir, model.fileName)
+                tempFile.delete()
+            } else {
+                Log.i(TAG, "Download complete, moving to models directory...")
+                emit(DownloadState.Extracting)
+                
+                // Direct copy for ONNX models (not compressed)
+                tempFile.renameTo(targetFile)
+            }
             
-            // Extract the tar.gz file
-            extractTarGz(tempFile, modelsDir, model.fileName)
-            
-            // Cleanup temp file
-            tempFile.delete()
-            
-            // Verify the model was extracted
+            // Verify the model file
             if (targetFile.exists() && targetFile.length() > 100_000) {
-                Log.i(TAG, "Model extracted successfully: ${targetFile.length()} bytes")
+                Log.i(TAG, "Model ready: ${targetFile.absolutePath} (${targetFile.length()} bytes)")
                 emit(DownloadState.Complete)
             } else {
-                throw Exception("Model extraction failed or file is too small")
+                throw Exception("Model file is missing or too small")
             }
             
         } catch (e: Exception) {
-            Log.e(TAG, "Download failed", e)
+            Log.e(TAG, "Download failed for ${model.name}", e)
             emit(DownloadState.Error(e.message ?: "Download failed"))
         }
     }.flowOn(Dispatchers.IO)
