@@ -87,6 +87,7 @@ class UltraDetailPipeline(
     // MFSR pipeline components (for ULTRA preset)
     private var mfsrPipeline: NativeMFSRPipeline? = null
     private var mfsrRefiner: MFSRRefiner? = null
+    private var onnxSR: OnnxSuperResolution? = null  // ONNX-based Real-ESRGAN
     private val gyroHelper = GyroAlignmentHelper()
     
     // Advanced alignment components
@@ -166,21 +167,49 @@ class UltraDetailPipeline(
                 
                 // Initialize neural refiner only for ULTRA preset
                 if (preset == UltraDetailPreset.ULTRA) {
+                    // Try ONNX-based Real-ESRGAN first (better quality)
+                    var onnxInitialized = false
                     try {
-                        mfsrRefiner = MFSRRefiner(context, RefinerConfig(
-                            tileSize = 128,
-                            overlap = 8,  // Optimized: reduced from 16 for faster processing
+                        onnxSR = OnnxSuperResolution(context, OnnxSRConfig(
+                            model = OnnxSRModel.REAL_ESRGAN_X4,
+                            tileSize = 256,
+                            overlap = 16,
                             useGpu = true,
-                            blendStrength = 0.7f
+                            numThreads = 4
                         ))
                         
-                        if (!mfsrRefiner!!.initialize()) {
-                            Log.w(TAG, "MFSR refiner initialization failed, will skip refinement")
-                            mfsrRefiner = null
+                        if (onnxSR!!.initialize()) {
+                            onnxInitialized = true
+                            Log.i(TAG, "ONNX Real-ESRGAN initialized successfully")
+                        } else {
+                            Log.w(TAG, "ONNX Real-ESRGAN initialization failed, falling back to TFLite")
+                            onnxSR?.close()
+                            onnxSR = null
                         }
                     } catch (e: Throwable) {
-                        Log.w(TAG, "MFSR refiner creation failed: ${e.message}")
-                        mfsrRefiner = null
+                        Log.w(TAG, "ONNX Real-ESRGAN not available: ${e.message}, falling back to TFLite")
+                        onnxSR?.close()
+                        onnxSR = null
+                    }
+                    
+                    // Fall back to TFLite ESRGAN if ONNX not available
+                    if (!onnxInitialized) {
+                        try {
+                            mfsrRefiner = MFSRRefiner(context, RefinerConfig(
+                                tileSize = 128,
+                                overlap = 8,  // Optimized: reduced from 16 for faster processing
+                                useGpu = true,
+                                blendStrength = 0.7f
+                            ))
+                            
+                            if (!mfsrRefiner!!.initialize()) {
+                                Log.w(TAG, "MFSR refiner initialization failed, will skip refinement")
+                                mfsrRefiner = null
+                            }
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "MFSR refiner creation failed: ${e.message}")
+                            mfsrRefiner = null
+                        }
                     }
                 }
                 
@@ -645,13 +674,25 @@ class UltraDetailPipeline(
         var resultBitmap: Bitmap = frame.bitmap
         
         // Try to apply refinement if available (ULTRA preset)
-        if (preset == UltraDetailPreset.ULTRA && mfsrRefiner != null) {
+        // Priority: ONNX Real-ESRGAN > TFLite ESRGAN
+        if (preset == UltraDetailPreset.ULTRA) {
             try {
-                Log.i(TAG, "║ Applying neural refinement to single frame...")
-                val refined = mfsrRefiner!!.refine(frame.bitmap) { _, _, _ -> }
-                if (refined != null) {
-                    resultBitmap = refined
-                    Log.i(TAG, "║ Neural refinement applied: ${refined.width}x${refined.height}")
+                when {
+                    onnxSR?.isReady() == true -> {
+                        Log.i(TAG, "║ Applying Real-ESRGAN (ONNX) to single frame...")
+                        val refined = onnxSR!!.upscale(frame.bitmap) { _, _, _ -> }
+                        resultBitmap = refined
+                        Log.i(TAG, "║ Real-ESRGAN applied: ${refined.width}x${refined.height}")
+                    }
+                    mfsrRefiner?.isReady() == true -> {
+                        Log.i(TAG, "║ Applying TFLite ESRGAN to single frame...")
+                        val refined = mfsrRefiner!!.refine(frame.bitmap) { _, _, _ -> }
+                        resultBitmap = refined
+                        Log.i(TAG, "║ TFLite ESRGAN applied: ${refined.width}x${refined.height}")
+                    }
+                    else -> {
+                        Log.i(TAG, "║ No SR model available for single frame")
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "║ Neural refinement failed, using original frame", e)
@@ -1328,31 +1369,63 @@ class UltraDetailPipeline(
         }
         
         // Stage 4: Neural refinement (optional, ULTRA preset only)
+        // Priority: ONNX Real-ESRGAN > TFLite ESRGAN > skip
         val stage4Start = System.currentTimeMillis()
-        val finalBitmap = if (mfsrRefiner?.isReady() == true && preset == UltraDetailPreset.ULTRA) {
-            Log.i(TAG, "║ Stage 4: Neural refinement starting (ULTRA preset)...")
-            _state.value = PipelineState.RefiningMFSR(0, 0)
-            
-            var lastRefineUpdate = 0L
-            try {
-                mfsrRefiner!!.refine(enhancedBitmap) { processed, total, _ ->
-                    // Throttle UI updates to reduce main thread load (max 10/sec)
-                    val now = System.currentTimeMillis()
-                    if (now - lastRefineUpdate >= 100 || processed == total) {
-                        _state.value = PipelineState.RefiningMFSR(processed, total)
-                        lastRefineUpdate = now
-                    }
-                }.also {
-                    if (it !== enhancedBitmap && enhancedBitmap !== outputBitmap) {
-                        enhancedBitmap.recycle()
+        val finalBitmap = if (preset == UltraDetailPreset.ULTRA) {
+            when {
+                // Use ONNX Real-ESRGAN if available (best quality)
+                onnxSR?.isReady() == true -> {
+                    Log.i(TAG, "║ Stage 4: Real-ESRGAN (ONNX) starting...")
+                    _state.value = PipelineState.RefiningMFSR(0, 0)
+                    
+                    var lastRefineUpdate = 0L
+                    try {
+                        onnxSR!!.upscale(enhancedBitmap) { processed, total, _ ->
+                            val now = System.currentTimeMillis()
+                            if (now - lastRefineUpdate >= 100 || processed == total) {
+                                _state.value = PipelineState.RefiningMFSR(processed, total)
+                                lastRefineUpdate = now
+                            }
+                        }.also {
+                            if (it !== enhancedBitmap && enhancedBitmap !== outputBitmap) {
+                                enhancedBitmap.recycle()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "║ Stage 4: Real-ESRGAN failed, using enhanced output", e)
+                        enhancedBitmap
                     }
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "║ Stage 4: Refinement failed, using enhanced output", e)
-                enhancedBitmap
+                // Fall back to TFLite ESRGAN
+                mfsrRefiner?.isReady() == true -> {
+                    Log.i(TAG, "║ Stage 4: TFLite ESRGAN starting...")
+                    _state.value = PipelineState.RefiningMFSR(0, 0)
+                    
+                    var lastRefineUpdate = 0L
+                    try {
+                        mfsrRefiner!!.refine(enhancedBitmap) { processed, total, _ ->
+                            val now = System.currentTimeMillis()
+                            if (now - lastRefineUpdate >= 100 || processed == total) {
+                                _state.value = PipelineState.RefiningMFSR(processed, total)
+                                lastRefineUpdate = now
+                            }
+                        }.also {
+                            if (it !== enhancedBitmap && enhancedBitmap !== outputBitmap) {
+                                enhancedBitmap.recycle()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "║ Stage 4: TFLite refinement failed, using enhanced output", e)
+                        enhancedBitmap
+                    }
+                }
+                else -> {
+                    Log.i(TAG, "║ Stage 4: No SR model available, skipping refinement")
+                    enhancedBitmap
+                }
             }
         } else {
-            Log.i(TAG, "║ Stage 4: Neural refinement SKIPPED (preset=$preset, refiner ready=${mfsrRefiner?.isReady()})")
+            Log.i(TAG, "║ Stage 4: Neural refinement SKIPPED (preset=$preset)")
             enhancedBitmap
         }
         val stage4Time = System.currentTimeMillis() - stage4Start
@@ -2418,10 +2491,12 @@ class UltraDetailPipeline(
         srProcessor?.close()
         mfsrPipeline?.close()
         mfsrRefiner?.close()
+        onnxSR?.close()
         nativeProcessor = null
         srProcessor = null
         mfsrPipeline = null
         mfsrRefiner = null
+        onnxSR = null
     }
     
     /**

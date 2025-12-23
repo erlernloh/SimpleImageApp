@@ -44,12 +44,27 @@ private const val TAG = "MFSRRefiner"
 /**
  * Neural model type for ULTRA upscaling
  */
-enum class RefinerModel(val assetPath: String, val description: String) {
-    // ESRGAN 4x upscaler - used for ULTRA preset (MFSR 2x + ESRGAN 4x = 8x total)
-    ESRGAN_REFINE("models/esrgan.tflite", "ESRGAN 4x neural upscaler"),
+enum class RefinerModel(
+    val assetPath: String, 
+    val description: String,
+    val modelType: ModelType = ModelType.TFLITE
+) {
+    // TFLite models (legacy)
+    ESRGAN_REFINE("models/esrgan.tflite", "ESRGAN 4x neural upscaler", ModelType.TFLITE),
+    LIGHTWEIGHT_REFINE("models/refiner.tflite", "Lightweight denoising/sharpening", ModelType.TFLITE),
     
-    // Placeholder for future dedicated 1:1 refinement model
-    LIGHTWEIGHT_REFINE("models/refiner.tflite", "Lightweight denoising/sharpening")
+    // ONNX models (Real-ESRGAN and advanced)
+    REAL_ESRGAN_X4("realesrgan_x4plus_fp16.onnx", "Real-ESRGAN x4plus (best quality)", ModelType.ONNX),
+    REAL_ESRGAN_X4_ANIME("realesrgan_x4plus_anime_fp16.onnx", "Real-ESRGAN x4plus anime", ModelType.ONNX),
+    SWINIR_X4("swinir_x4_fp16.onnx", "SwinIR x4 (transformer)", ModelType.ONNX)
+}
+
+/**
+ * Model runtime type
+ */
+enum class ModelType {
+    TFLITE,  // TensorFlow Lite
+    ONNX     // ONNX Runtime
 }
 
 /**
