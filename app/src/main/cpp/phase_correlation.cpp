@@ -454,25 +454,47 @@ FlowField HybridAligner::computeAlignment(
     
     float finalShiftX, finalShiftY, confidence;
     
-    if (pcResult.isValid && pcResult.confidence > 0.3f) {
-        // Use phase correlation result
+    // Maximum allowed shift in pixels - larger shifts indicate misalignment or excessive motion
+    // For handheld burst capture, shifts should typically be <20 pixels
+    const float maxAllowedShift = 30.0f;
+    
+    // Check if phase correlation result is reasonable
+    float pcShiftMagnitude = std::sqrt(pcResult.shiftX * pcResult.shiftX + 
+                                        pcResult.shiftY * pcResult.shiftY);
+    bool pcShiftReasonable = pcShiftMagnitude < maxAllowedShift;
+    
+    // Check if gyro estimate is reasonable
+    float gyroShiftMagnitude = std::sqrt(gyroShiftX * gyroShiftX + gyroShiftY * gyroShiftY);
+    bool gyroShiftReasonable = gyroShiftMagnitude < maxAllowedShift;
+    
+    if (pcResult.isValid && pcResult.confidence > 0.5f && pcShiftReasonable) {
+        // Use phase correlation result - high confidence and reasonable magnitude
         finalShiftX = pcResult.shiftX;
         finalShiftY = pcResult.shiftY;
         confidence = pcResult.confidence;
-        LOGD("HybridAligner: Using phase correlation = (%.2f, %.2f), conf=%.2f",
-             finalShiftX, finalShiftY, confidence);
-    } else if (gyroHomography && gyroHomography->isValid) {
-        // Fall back to gyro
+        LOGD("HybridAligner: Using phase correlation = (%.2f, %.2f), conf=%.2f, mag=%.2f",
+             finalShiftX, finalShiftY, confidence, pcShiftMagnitude);
+    } else if (pcResult.isValid && pcResult.confidence > 0.3f && pcShiftReasonable) {
+        // Use phase correlation with moderate confidence
+        finalShiftX = pcResult.shiftX;
+        finalShiftY = pcResult.shiftY;
+        confidence = pcResult.confidence * 0.8f;  // Reduce confidence slightly
+        LOGD("HybridAligner: Using phase correlation (moderate) = (%.2f, %.2f), conf=%.2f, mag=%.2f",
+             finalShiftX, finalShiftY, confidence, pcShiftMagnitude);
+    } else if (gyroHomography && gyroHomography->isValid && gyroShiftReasonable) {
+        // Fall back to gyro if it's reasonable
         finalShiftX = gyroShiftX;
         finalShiftY = gyroShiftY;
-        confidence = 0.5f;
-        LOGD("HybridAligner: Falling back to gyro = (%.2f, %.2f)", finalShiftX, finalShiftY);
+        confidence = 0.4f;
+        LOGD("HybridAligner: Falling back to gyro = (%.2f, %.2f), mag=%.2f", 
+             finalShiftX, finalShiftY, gyroShiftMagnitude);
     } else {
-        // No alignment available
+        // Both estimates are unreasonable - use zero shift (frame likely has too much motion)
         finalShiftX = 0.0f;
         finalShiftY = 0.0f;
-        confidence = 0.1f;
-        LOGW("HybridAligner: No alignment available, using zero shift");
+        confidence = 0.1f;  // Very low confidence signals this frame should be weighted less
+        LOGW("HybridAligner: Shifts too large (pc=%.2f, gyro=%.2f), using zero shift - frame may have excessive motion",
+             pcShiftMagnitude, gyroShiftMagnitude);
     }
     
     // Step 3: Fill flow field with uniform shift (or local refinement if enabled)
@@ -498,12 +520,18 @@ FlowField HybridAligner::computeAlignment(
                 );
                 
                 float tileShiftX, tileShiftY, tileConf;
-                if (tileResult.isValid && tileResult.confidence > 0.2f) {
+                
+                // Check if tile shift is reasonable
+                float tileMagnitude = std::sqrt(tileResult.shiftX * tileResult.shiftX + 
+                                                 tileResult.shiftY * tileResult.shiftY);
+                bool tileShiftReasonable = tileMagnitude < maxAllowedShift;
+                
+                if (tileResult.isValid && tileResult.confidence > 0.3f && tileShiftReasonable) {
                     tileShiftX = tileResult.shiftX;
                     tileShiftY = tileResult.shiftY;
                     tileConf = tileResult.confidence;
                 } else {
-                    // Use global shift for this tile
+                    // Use global shift for this tile (or zero if global is also bad)
                     tileShiftX = finalShiftX;
                     tileShiftY = finalShiftY;
                     tileConf = confidence * 0.5f;

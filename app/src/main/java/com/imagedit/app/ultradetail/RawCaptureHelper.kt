@@ -104,17 +104,22 @@ class RawCaptureHelper(private val context: Context) {
         context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     }
     
+    var rawCapability: RawCaptureCapability? = null
+        private set
+    
     /**
      * Check if RAW capture is supported on the back camera
      */
     fun checkRawSupport(): RawCaptureCapability {
-        return try {
+        val capability = try {
             val cameraId = getBackCameraId() ?: return RawCaptureCapability.NOT_SUPPORTED
             checkRawSupportForCamera(cameraId)
         } catch (e: Exception) {
             Log.e(TAG, "Error checking RAW support", e)
             RawCaptureCapability.NOT_SUPPORTED
         }
+        rawCapability = capability
+        return capability
     }
     
     /**

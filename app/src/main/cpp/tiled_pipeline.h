@@ -23,6 +23,7 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 namespace ultradetail {
 
@@ -250,6 +251,9 @@ private:
     
     // MFSR processor (reused across tiles)
     std::unique_ptr<MultiFrameSR> mfsrProcessor_;
+    
+    // Mutex to protect shared alignment resources during multi-threaded processing
+    mutable std::mutex alignmentMutex_;
     
     /**
      * Extract tile crop from image with padding

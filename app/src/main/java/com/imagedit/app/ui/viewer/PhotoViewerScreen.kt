@@ -1,6 +1,7 @@
 package com.imagedit.app.ui.viewer
 
 import android.content.ContentResolver
+import android.content.Intent
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.compose.foundation.background
@@ -50,11 +51,27 @@ fun PhotoViewerScreen(
                     }
                 },
                 actions = {
-                    // Export button (if provided)
-                    onExportPhoto?.let { exportCallback ->
-                        IconButton(onClick = { exportCallback(photoUri) }) {
-                            Icon(Icons.Default.Share, contentDescription = "Export")
+                    // Share button - direct share functionality
+                    IconButton(
+                        onClick = {
+                            android.util.Log.d("PhotoViewerScreen", "Share button clicked for: $photoUri")
+                            try {
+                                val uri = Uri.parse(photoUri)
+                                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "image/*"
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(
+                                    Intent.createChooser(shareIntent, "Share photo")
+                                )
+                                android.util.Log.d("PhotoViewerScreen", "Share intent started successfully")
+                            } catch (e: Exception) {
+                                android.util.Log.e("PhotoViewerScreen", "Failed to share photo", e)
+                            }
                         }
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = "Share")
                     }
                     
                     // Edit button

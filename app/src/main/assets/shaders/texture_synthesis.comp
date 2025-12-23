@@ -1,0 +1,95 @@
+#version 320 es
+
+/**
+ * texture_synthesis.comp - GPU Compute Shader for Texture Synthesis
+ * 
+ * Phase 2 stub: Basic tile processing on GPU
+ * Phase 3 will implement full patch-based synthesis
+ */
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Input/Output textures
+layout(binding = 0) uniform sampler2D inputTex;
+layout(binding = 1, rgba8) uniform writeonly image2D outputImg;
+
+// Synthesis parameters (uniform buffer)
+layout(std140, binding = 2) uniform SynthParams {
+    int patchSize;
+    int searchRadius;
+    float blendWeight;
+    float varianceThreshold;
+    int tileOffsetX;
+    int tileOffsetY;
+    int tileWidth;
+    int tileHeight;
+};
+
+/**
+ * Simple luminance calculation
+ */
+float luminance(vec3 color) {
+    return dot(color, vec3(0.299, 0.587, 0.114));
+}
+
+/**
+ * Compute local variance (simplified)
+ */
+float computeVariance(ivec2 coord, int radius) {
+    float sum = 0.0;
+    float sum2 = 0.0;
+    int count = 0;
+    
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            ivec2 sampleCoord = coord + ivec2(dx, dy);
+            vec4 color = texelFetch(inputTex, sampleCoord, 0);
+            float lum = luminance(color.rgb);
+            
+            sum += lum;
+            sum2 += lum * lum;
+            count++;
+        }
+    }
+    
+    if (count < 2) return 0.0;
+    
+    float mean = sum / float(count);
+    float variance = (sum2 / float(count)) - (mean * mean);
+    return variance;
+}
+
+/**
+ * Phase 2 Stub: Simple copy with variance check
+ * Phase 3 will implement full patch search and synthesis
+ */
+void main() {
+    ivec2 globalCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 tileCoord = globalCoord + ivec2(tileOffsetX, tileOffsetY);
+    
+    // Bounds check
+    ivec2 texSize = textureSize(inputTex, 0);
+    if (tileCoord.x >= texSize.x || tileCoord.y >= texSize.y) {
+        return;
+    }
+    
+    // Fetch input pixel
+    vec4 inputColor = texelFetch(inputTex, tileCoord, 0);
+    
+    // Compute local variance
+    int radius = patchSize / 2;
+    float variance = computeVariance(tileCoord, radius);
+    
+    // Phase 2 stub: If variance is low, mark for synthesis (but just copy for now)
+    // Phase 3 will implement actual patch search and blending here
+    vec4 outputColor = inputColor;
+    
+    if (variance < varianceThreshold) {
+        // Low variance region - would synthesize detail here in Phase 3
+        // For now, just slightly brighten to indicate processing
+        outputColor.rgb = min(inputColor.rgb * 1.05, vec3(1.0));
+    }
+    
+    // Write output
+    imageStore(outputImg, globalCoord, outputColor);
+}

@@ -35,8 +35,12 @@ private const val TAG = "UltraDetailViewModel"
 enum class UiProcessingStage {
     IDLE,
     CAPTURING,
+    SELECTING_FRAMES,      // NEW: Motion rejection + Lucky Imaging
+    CLASSIFYING_SCENE,     // NEW: Scene classification
     ALIGNING,
+    EXPOSURE_FUSION,       // NEW: HDR exposure fusion
     SUPER_RESOLUTION,
+    DETAIL_TRANSFER,       // NEW: Reference detail transfer
     REFINING,
     FINALIZING
 }
@@ -78,7 +82,15 @@ data class UltraDetailUiState(
     val isModelAvailable: Boolean = false,
     // Fix #2: RAW capture support
     val isRawCaptureSupported: Boolean = false,
-    val rawCaptureEnabled: Boolean = false  // User preference to use RAW when available
+    val rawCaptureEnabled: Boolean = false,  // User preference to use RAW when available
+    val rawBurstUris: List<Uri> = emptyList(),
+    // Device capability and thermal management
+    val deviceTier: DeviceTier = DeviceTier.MID_RANGE,
+    val selectedQualityTier: QualityTier = QualityTier.QUALITY,
+    val thermalState: ThermalState = ThermalState.NORMAL,
+    val thermalTemperature: Float = 30f,
+    val thermalMessage: String = "",
+    val isPausedForThermal: Boolean = false
 )
 
 /**
@@ -94,18 +106,22 @@ class UltraDetailViewModel @Inject constructor(
     
     private var pipeline: UltraDetailPipeline? = null
     private var burstController: BurstCaptureController? = null
+    private var rawBurstController: RawBurstCaptureController? = null
     private val modelDownloader = ModelDownloader(context)
-    
-    // Fix #2: RAW capture helper
     private val rawCaptureHelper = RawCaptureHelper(context)
+    private val deviceCapabilityManager = DeviceCapabilityManager(context)
+    private var currentRawCacheFiles: List<java.io.File> = emptyList()
     
     /**
      * Initialize the Ultra Detail+ pipeline
      */
     fun initialize() {
+        Log.i(TAG, "initialize: STARTING ViewModel initialization")
         viewModelScope.launch {
             try {
+                Log.d(TAG, "initialize: Creating UltraDetailPipeline")
                 pipeline = UltraDetailPipeline(context)
+                Log.i(TAG, "initialize: Pipeline created successfully")
                 
                 // Check if SR model is available
                 val modelAvailable = modelDownloader.isModelAvailable(AvailableModels.ESRGAN_FP16)
@@ -125,17 +141,40 @@ class UltraDetailViewModel @Inject constructor(
                     }
                 }
                 
+                // Observe thermal state for UI updates
+                launch(Dispatchers.Main) {
+                    pipeline?.thermalState?.collect { thermalStatus ->
+                        thermalStatus?.let { status ->
+                            _uiState.value = _uiState.value.copy(
+                                thermalState = status.state,
+                                thermalTemperature = status.temperatureCelsius,
+                                thermalMessage = status.message,
+                                isPausedForThermal = status.shouldPause
+                            )
+                        }
+                    }
+                }
+                
+                // Get device capability for UI
+                val deviceCapability = pipeline?.getDeviceCapability() ?: DeviceCapability.unknown()
+                
                 _uiState.value = _uiState.value.copy(
                     isInitialized = true,
                     statusMessage = "Ready",
                     isModelAvailable = modelAvailable,
-                    isRawCaptureSupported = rawCapability.isRawSupported
+                    isRawCaptureSupported = rawCapability.isRawSupported,
+                    deviceTier = deviceCapability.tier
                 )
                 
-                Log.d(TAG, "ViewModel initialized, SR model available: $modelAvailable, RAW supported: ${rawCapability.isRawSupported}")
+                Log.i(TAG, "initialize: ViewModel initialized successfully")
+                Log.i(TAG, "  - SR model available: $modelAvailable")
+                Log.i(TAG, "  - RAW supported: ${rawCapability.isRawSupported}")
+                Log.i(TAG, "  - Device tier: ${deviceCapability.tier}")
+                Log.i(TAG, "  - Pipeline ready: ${pipeline != null}")
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Initialization failed", e)
+                Log.e(TAG, "initialize: Initialization FAILED", e)
+                e.printStackTrace()
                 _uiState.value = _uiState.value.copy(
                     error = "Failed to initialize: ${e.message}"
                 )
@@ -226,6 +265,33 @@ class UltraDetailViewModel @Inject constructor(
     }
     
     /**
+     * Set the quality tier for multi-tier processing
+     * 
+     * @param tier Quality tier (QUICK, QUALITY, MAXIMUM)
+     */
+    fun setQualityTier(tier: QualityTier) {
+        _uiState.value = _uiState.value.copy(selectedQualityTier = tier)
+        
+        // Update estimated time based on device capability and tier
+        val estimatedTime = pipeline?.getQualityTierConfig(tier)?.estimatedTimeSeconds ?: 60
+        _uiState.value = _uiState.value.copy(
+            estimatedTotalTimeMs = estimatedTime * 1000L
+        )
+        
+        Log.d(TAG, "Quality tier changed to: $tier, estimated time: ${estimatedTime}s")
+    }
+    
+    /**
+     * Get available quality tiers with device-adjusted configurations
+     */
+    fun getAvailableQualityTiers(): List<QualityTierConfig> {
+        val capability = pipeline?.getDeviceCapability() ?: DeviceCapability.unknown()
+        return QualityTier.entries.map { tier ->
+            capability.getQualityTierConfig(tier)
+        }
+    }
+    
+    /**
      * Set the refinement blend strength (ULTRA preset only)
      * 
      * @param strength 0.0 = original MFSR output, 1.0 = fully refined
@@ -249,45 +315,59 @@ class UltraDetailViewModel @Inject constructor(
         Log.d(TAG, "Denoise strength set to: $strength")
     }
     
+    fun setRawCaptureEnabled(enabled: Boolean) {
+        _uiState.value = _uiState.value.copy(rawCaptureEnabled = enabled)
+        Log.d(TAG, "RAW capture enabled: $enabled")
+    }
+    
     /**
      * Start burst capture and processing
      * Automatically selects high-quality or preview capture based on config
      */
     fun startCapture(burstController: BurstCaptureController) {
         if (_uiState.value.isCapturing || _uiState.value.isProcessing) {
+            Log.w(TAG, "startCapture: Already capturing or processing, ignoring")
             return
         }
         
         this.burstController = burstController
         val useHighQuality = burstController.config.captureQuality == CaptureQuality.HIGH_QUALITY
+        val preset = _uiState.value.selectedPreset
+        val shouldUseRaw = _uiState.value.rawCaptureEnabled &&
+                          _uiState.value.isRawCaptureSupported &&
+                          (preset == UltraDetailPreset.MAX || preset == UltraDetailPreset.ULTRA)
+        
+        Log.i(TAG, "startCapture: preset=$preset, useHighQuality=$useHighQuality, shouldUseRaw=$shouldUseRaw")
         
         viewModelScope.launch {
             try {
-                val qualityLabel = if (useHighQuality) "high-quality" else "preview"
                 _uiState.value = _uiState.value.copy(
                     isCapturing = true,
                     captureProgress = 0f,
-                    statusMessage = "Capturing $qualityLabel burst...",
+                    statusMessage = if (shouldUseRaw) "Capturing RAW burst..." else "Capturing burst...",
                     error = null,
-                    resultBitmap = null
+                    resultBitmap = null,
+                    rawBurstUris = emptyList()
                 )
                 
-                // Observe burst capture state
-                launch {
-                    burstController.captureState.collect { state ->
-                        handleBurstState(state)
-                    }
-                }
-                
-                val preset = _uiState.value.selectedPreset
-                
-                // Choose capture path based on quality setting
-                if (useHighQuality) {
-                    // High-quality capture path (ImageCapture)
-                    processHighQualityCapture(burstController, preset)
+                if (shouldUseRaw) {
+                    Log.i(TAG, "startCapture: Using RAW capture path")
+                    processRawCapture(preset)
                 } else {
-                    // Preview capture path (ImageAnalysis) - existing behavior
-                    processPreviewCapture(burstController, preset)
+                    Log.i(TAG, "startCapture: Using standard capture path (highQuality=$useHighQuality)")
+                    // Observe burst capture state
+                    launch {
+                        burstController.captureState.collect { state ->
+                            handleBurstState(state)
+                        }
+                    }
+                    
+                    // Choose capture path based on quality setting
+                    if (useHighQuality) {
+                        processHighQualityCapture(burstController, preset)
+                    } else {
+                        processPreviewCapture(burstController, preset)
+                    }
                 }
                 
             } catch (e: Exception) {
@@ -302,6 +382,85 @@ class UltraDetailViewModel @Inject constructor(
     }
     
     /**
+     * Process using RAW burst capture (Camera2 RAW+YUV)
+     * Falls back to standard capture if RAW is unavailable or fails
+     */
+    private suspend fun processRawCapture(preset: UltraDetailPreset) {
+        val rawCap = rawCaptureHelper.rawCapability
+        if (rawCap == null || !rawCap.isRawSupported) {
+            Log.w(TAG, "RAW capture not available, falling back to standard capture")
+            _uiState.value = _uiState.value.copy(
+                statusMessage = "RAW not available, using standard capture..."
+            )
+            fallbackToStandardCapture(preset)
+            return
+        }
+        
+        if (rawBurstController == null) {
+            rawBurstController = RawBurstCaptureController(context, rawCap)
+        }
+        
+        val deviceCap = deviceCapabilityManager.detectCapabilities()
+        val frameCount = burstController?.config?.frameCount ?: 12
+        
+        val result = try {
+            rawBurstController!!.captureRawBurst(preset, deviceCap, frameCount)
+        } catch (e: Exception) {
+            Log.e(TAG, "RAW capture failed, falling back to standard capture", e)
+            _uiState.value = _uiState.value.copy(
+                statusMessage = "RAW capture failed, using standard capture..."
+            )
+            fallbackToStandardCapture(preset)
+            return
+        }
+        
+        Log.i(TAG, "RAW capture complete: ${result.selectedFrameCount}/${result.capturedFrameCount} frames, ${result.dngUris.size} DNGs")
+        
+        currentRawCacheFiles = result.rawCacheFiles
+        
+        _uiState.value = _uiState.value.copy(
+            isCapturing = false,
+            rawBurstUris = result.dngUris
+        )
+        
+        // TODO: Process raw-cache files through native pipeline
+        // For now, just show DNGs saved message
+        _uiState.value = _uiState.value.copy(
+            statusMessage = "RAW burst saved (${result.dngUris.size} DNGs). Processing coming soon...",
+            error = null
+        )
+    }
+    
+    /**
+     * Fallback to standard capture when RAW is unavailable or fails
+     */
+    private suspend fun fallbackToStandardCapture(preset: UltraDetailPreset) {
+        val controller = burstController
+        if (controller == null) {
+            _uiState.value = _uiState.value.copy(
+                isCapturing = false,
+                error = "Capture controller not available"
+            )
+            return
+        }
+        
+        // Observe burst capture state
+        viewModelScope.launch {
+            controller.captureState.collect { state ->
+                handleBurstState(state)
+            }
+        }
+        
+        // Use high-quality capture for MAX/ULTRA presets
+        val useHighQuality = controller.config.captureQuality == CaptureQuality.HIGH_QUALITY
+        if (useHighQuality) {
+            processHighQualityCapture(controller, preset)
+        } else {
+            processPreviewCapture(controller, preset)
+        }
+    }
+    
+    /**
      * Process using high-quality capture (ImageCapture - full resolution)
      * 
      * Fix #1: Proper exception handling for capture failures
@@ -312,8 +471,11 @@ class UltraDetailViewModel @Inject constructor(
         burstController: BurstCaptureController,
         preset: UltraDetailPreset
     ) {
+        Log.i(TAG, "processHighQualityCapture: Starting HQ capture for preset=$preset")
+        
         // Fix #1: Wrap capture in try-catch to handle partial failures
         val hqFrames = try {
+            Log.d(TAG, "processHighQualityCapture: Calling startHighQualityCapture")
             burstController.startHighQualityCapture(viewModelScope)
         } catch (e: Exception) {
             Log.e(TAG, "HQ capture failed with exception", e)
@@ -332,7 +494,7 @@ class UltraDetailViewModel @Inject constructor(
             return
         }
         
-        Log.i(TAG, "HQ Capture complete: ${hqFrames.size} frames")
+        Log.i(TAG, "processHighQualityCapture: HQ Capture complete: ${hqFrames.size} frames")
         
         // Fix #3: Check pipeline is initialized before processing
         val activePipeline = pipeline ?: run {
@@ -359,6 +521,14 @@ class UltraDetailViewModel @Inject constructor(
         // Fix #5: Device-aware processing time estimates
         val estimatedTime = estimateProcessingTime(preset, isHighQuality = true)
         
+        // Generate quick preview from captured frames to show during processing
+        val previewBitmap = try {
+            activePipeline.generateQuickPreview(hqFrames)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to generate preview: ${e.message}")
+            null
+        }
+        
         _uiState.value = _uiState.value.copy(
             isCapturing = false,
             isProcessing = true,
@@ -368,13 +538,16 @@ class UltraDetailViewModel @Inject constructor(
             estimatedTotalTimeMs = estimatedTime,
             currentTile = 0,
             totalTiles = 0,
-            statusMessage = "Processing high-quality frames..."
+            statusMessage = "Processing high-quality frames...",
+            previewBitmap = previewBitmap
         )
         
         // Initialize pipeline
+        Log.i(TAG, "processHighQualityCapture: Initializing pipeline for preset=$preset")
         activePipeline.initialize(preset)
         
         if (preset == UltraDetailPreset.ULTRA) {
+            Log.d(TAG, "processHighQualityCapture: Setting refinement strength=${_uiState.value.refinementStrength}")
             activePipeline.setRefinementStrength(_uiState.value.refinementStrength)
         }
         
@@ -383,17 +556,21 @@ class UltraDetailViewModel @Inject constructor(
         var processingException: Exception? = null
         
         try {
+            Log.i(TAG, "processHighQualityCapture: Starting pipeline processing (timeout=${estimatedTime * 2}ms)")
             // Fix #8: Add timeout for processing
             result = withTimeoutOrNull(estimatedTime * 2) {
                 activePipeline.processHighQuality(hqFrames, preset, viewModelScope)
             }
             
             if (result == null) {
-                Log.e(TAG, "Processing timeout after ${estimatedTime * 2}ms")
+                Log.e(TAG, "processHighQualityCapture: Processing timeout after ${estimatedTime * 2}ms")
                 processingException = Exception("Processing timeout")
+            } else {
+                Log.i(TAG, "processHighQualityCapture: Processing completed successfully")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Processing failed with exception", e)
+            Log.e(TAG, "processHighQualityCapture: Processing failed with exception", e)
+            e.printStackTrace()
             processingException = e
         } finally {
             // Fix #2: Safe frame recycling - each frame in its own try-catch
@@ -411,12 +588,14 @@ class UltraDetailViewModel @Inject constructor(
         
         // Handle result or exception
         if (processingException != null) {
+            Log.e(TAG, "processHighQualityCapture: Showing error to user: ${processingException.message}")
             _uiState.value = _uiState.value.copy(
                 isProcessing = false,
                 processingStage = UiProcessingStage.IDLE,
                 error = "Processing failed: ${processingException.message}"
             )
         } else {
+            Log.i(TAG, "processHighQualityCapture: Handling processing result")
             handleProcessingResult(result)
         }
     }
@@ -480,7 +659,7 @@ class UltraDetailViewModel @Inject constructor(
         if (preset == UltraDetailPreset.ULTRA) {
             viewModelScope.launch {
                 val preview = withContext(Dispatchers.Default) {
-                    activePipeline.generateQuickPreview(frames)
+                    activePipeline.generateQuickPreviewYUV(frames)
                 }
                 _uiState.value = _uiState.value.copy(previewBitmap = preview)
             }
@@ -494,6 +673,14 @@ class UltraDetailViewModel @Inject constructor(
         // Fix #5: Device-aware processing time estimates
         val estimatedTime = estimateProcessingTime(preset, isHighQuality = false)
         
+        // Generate quick preview from captured frames to show during processing
+        val previewBitmap = try {
+            activePipeline.generateQuickPreviewYUV(frames)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to generate preview: ${e.message}")
+            null
+        }
+        
         _uiState.value = _uiState.value.copy(
             isCapturing = false,
             isProcessing = true,
@@ -503,7 +690,8 @@ class UltraDetailViewModel @Inject constructor(
             estimatedTotalTimeMs = estimatedTime,
             currentTile = 0,
             totalTiles = 0,
-            statusMessage = "Aligning frames..."
+            statusMessage = "Aligning frames...",
+            previewBitmap = previewBitmap
         )
         
         // Initialize pipeline
@@ -563,11 +751,12 @@ class UltraDetailViewModel @Inject constructor(
         
         // Base times increased significantly to avoid false timeouts on real devices
         // Real-world processing times can vary widely based on image complexity and device load
+        // ULTRA preset with texture synthesis can take 12+ minutes on large images
         val baseTime = when (preset) {
             UltraDetailPreset.FAST -> if (isHighQuality) 10000L else 5000L
             UltraDetailPreset.BALANCED -> if (isHighQuality) 20000L else 10000L
             UltraDetailPreset.MAX -> if (isHighQuality) 120000L else 60000L      // 2 min base for MAX
-            UltraDetailPreset.ULTRA -> if (isHighQuality) 300000L else 180000L   // 5 min base for ULTRA
+            UltraDetailPreset.ULTRA -> if (isHighQuality) 600000L else 300000L   // 10 min base for ULTRA (texture synthesis is slow)
         }
         
         // Adjust based on device performance
@@ -660,15 +849,39 @@ class UltraDetailViewModel @Inject constructor(
      */
     fun clearResult() {
         _uiState.value.resultBitmap?.recycle()
+        cleanupRawCacheFiles()
         _uiState.value = _uiState.value.copy(
             resultBitmap = null,
             savedUri = null,
+            rawBurstUris = emptyList(),
             processingTimeMs = 0,
             framesUsed = 0,
             detailTilesCount = 0,
             srTilesProcessed = 0,
             statusMessage = "Ready"
         )
+    }
+    
+    /**
+     * Clean up raw-cache files from app cache directory
+     */
+    private fun cleanupRawCacheFiles() {
+        if (currentRawCacheFiles.isEmpty()) return
+        
+        viewModelScope.launch(Dispatchers.IO) {
+            var deletedCount = 0
+            currentRawCacheFiles.forEach { file ->
+                try {
+                    if (file.exists() && file.delete()) {
+                        deletedCount++
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to delete raw-cache file: ${file.name}", e)
+                }
+            }
+            currentRawCacheFiles = emptyList()
+            Log.d(TAG, "Cleaned up $deletedCount raw-cache files")
+        }
     }
     
     /**
@@ -770,9 +983,14 @@ class UltraDetailViewModel @Inject constructor(
         when (state) {
             is BurstCaptureState.Capturing -> {
                 val progress = state.framesCollected.toFloat() / state.totalFrames
+                val message = if (state.exposureInfo.isNotEmpty()) {
+                    "Frame ${state.framesCollected}/${state.totalFrames}: ${state.exposureInfo}"
+                } else {
+                    "Capturing ${state.framesCollected}/${state.totalFrames}..."
+                }
                 _uiState.value = _uiState.value.copy(
                     captureProgress = progress,
-                    statusMessage = "Capturing ${state.framesCollected}/${state.totalFrames}..."
+                    statusMessage = message
                 )
             }
             is BurstCaptureState.Complete -> {
@@ -806,15 +1024,45 @@ class UltraDetailViewModel @Inject constructor(
         when (state) {
             is PipelineState.ProcessingBurst -> {
                 // Map pipeline stage to UI stage based on the actual processing stage
-                val uiStage = when (state.stage) {
-                    ProcessingStage.CONVERTING_YUV,
-                    ProcessingStage.BUILDING_PYRAMIDS,
-                    ProcessingStage.ALIGNING_FRAMES -> UiProcessingStage.ALIGNING
-                    ProcessingStage.MERGING_FRAMES,
-                    ProcessingStage.COMPUTING_EDGES,
-                    ProcessingStage.GENERATING_MASK -> UiProcessingStage.REFINING
-                    ProcessingStage.MULTI_FRAME_SR -> UiProcessingStage.SUPER_RESOLUTION
-                    ProcessingStage.COMPLETE -> UiProcessingStage.FINALIZING
+                // Enhanced mapping to show new processing stages
+                val uiStage = when {
+                    // Frame selection stages (Lucky Imaging, Motion Rejection)
+                    state.message.contains("selecting", ignoreCase = true) ||
+                    state.message.contains("lucky", ignoreCase = true) ||
+                    state.message.contains("motion", ignoreCase = true) -> UiProcessingStage.SELECTING_FRAMES
+                    
+                    // Scene classification
+                    state.message.contains("scene", ignoreCase = true) ||
+                    state.message.contains("classif", ignoreCase = true) ||
+                    state.message.contains("analyzing", ignoreCase = true) -> UiProcessingStage.CLASSIFYING_SCENE
+                    
+                    // Exposure fusion
+                    state.message.contains("exposure", ignoreCase = true) ||
+                    state.message.contains("fusion", ignoreCase = true) ||
+                    state.message.contains("HDR", ignoreCase = true) -> UiProcessingStage.EXPOSURE_FUSION
+                    
+                    // Alignment stages
+                    state.stage == ProcessingStage.CONVERTING_YUV ||
+                    state.stage == ProcessingStage.BUILDING_PYRAMIDS ||
+                    state.stage == ProcessingStage.ALIGNING_FRAMES ||
+                    state.message.contains("align", ignoreCase = true) -> UiProcessingStage.ALIGNING
+                    
+                    // Detail transfer
+                    state.message.contains("detail transfer", ignoreCase = true) ||
+                    state.message.contains("reference detail", ignoreCase = true) -> UiProcessingStage.DETAIL_TRANSFER
+                    
+                    // Merging/refining
+                    state.stage == ProcessingStage.MERGING_FRAMES ||
+                    state.stage == ProcessingStage.COMPUTING_EDGES ||
+                    state.stage == ProcessingStage.GENERATING_MASK -> UiProcessingStage.REFINING
+                    
+                    // Super-resolution
+                    state.stage == ProcessingStage.MULTI_FRAME_SR -> UiProcessingStage.SUPER_RESOLUTION
+                    
+                    // Finalizing
+                    state.stage == ProcessingStage.COMPLETE -> UiProcessingStage.FINALIZING
+                    
+                    // Default
                     else -> UiProcessingStage.ALIGNING
                 }
                 _uiState.value = _uiState.value.copy(
@@ -854,6 +1102,23 @@ class UltraDetailViewModel @Inject constructor(
                     }
                 )
             }
+            is PipelineState.SynthesizingTexture -> {
+                val progress = if (state.totalTiles > 0) {
+                    state.tilesProcessed.toFloat() / state.totalTiles
+                } else 0f
+                
+                _uiState.value = _uiState.value.copy(
+                    processingProgress = progress,
+                    processingStage = UiProcessingStage.REFINING,
+                    currentTile = state.tilesProcessed,
+                    totalTiles = state.totalTiles,
+                    statusMessage = if (state.totalTiles > 0) {
+                        "Texture synthesis: ${state.tilesProcessed}/${state.totalTiles} tiles (${(progress * 100).toInt()}%) [CPU: ${state.cpuTiles}]"
+                    } else {
+                        "Initializing texture synthesis..."
+                    }
+                )
+            }
             is PipelineState.RefiningMFSR -> {
                 val progress = if (state.totalTiles > 0) {
                     state.tilesProcessed.toFloat() / state.totalTiles
@@ -861,10 +1126,14 @@ class UltraDetailViewModel @Inject constructor(
                 
                 _uiState.value = _uiState.value.copy(
                     processingProgress = progress,
-                    processingStage = UiProcessingStage.SUPER_RESOLUTION,
+                    processingStage = UiProcessingStage.REFINING,  // Fixed: Use REFINING stage
                     currentTile = state.tilesProcessed,
                     totalTiles = state.totalTiles,
-                    statusMessage = "Neural refinement: ${state.tilesProcessed}/${state.totalTiles} tiles"
+                    statusMessage = if (state.totalTiles > 0) {
+                        "Neural refinement: ${state.tilesProcessed}/${state.totalTiles} tiles (${(progress * 100).toInt()}%)"
+                    } else {
+                        "Initializing neural refinement..."
+                    }
                 )
             }
             is PipelineState.Complete -> {

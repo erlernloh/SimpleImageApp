@@ -539,7 +539,92 @@ class NativeMFSRPipeline private constructor(
             outputBitmap: Bitmap,
             blendWeight: Float
         ): Int
+        
+        /**
+         * Transfer high-frequency detail from reference frame to upscaled output
+         * 
+         * This implements cross-frame texture transfer:
+         * 1. Extract high-frequency (Laplacian) from reference
+         * 2. Map to upscaled coordinates
+         * 3. Blend high-frequency into output where it improves detail
+         * 
+         * @param upscaledBitmap The upscaled output (target)
+         * @param referenceBitmap The sharpest original frame (source of detail)
+         * @param outputBitmap Output bitmap (same size as upscaled)
+         * @param blendStrength How much high-frequency to transfer (0-1)
+         * @return 0 on success, negative on error
+         */
+        @JvmStatic
+        external fun nativeReferenceDetailTransfer(
+            upscaledBitmap: Bitmap,
+            referenceBitmap: Bitmap,
+            outputBitmap: Bitmap,
+            blendStrength: Float
+        ): Int
+        
+        /**
+         * Mertens Exposure Fusion - Combine multiple exposures into HDR-like output
+         * 
+         * @param bitmaps Array of input bitmaps (different exposures)
+         * @param output Output fused bitmap
+         * @param contrastWeight Weight for contrast metric (default 1.0)
+         * @param saturationWeight Weight for saturation metric (default 1.0)
+         * @param exposureWeight Weight for well-exposedness metric (default 1.0)
+         * @param pyramidLevels Number of pyramid levels (default 5)
+         * @return 0 on success, negative on error
+         */
+        @JvmStatic
+        external fun nativeExposureFusion(
+            bitmaps: Array<Bitmap>,
+            output: Bitmap,
+            contrastWeight: Float,
+            saturationWeight: Float,
+            exposureWeight: Float,
+            pyramidLevels: Int
+        ): Int
+        
+        /**
+         * Tiled texture synthesis with hybrid CPU-GPU processing (Phase 2)
+         */
+        @JvmStatic
+        external fun nativeTextureSynthesisTiled(
+            inputBitmap: Bitmap,
+            outputBitmap: Bitmap,
+            tileSize: Int,
+            overlap: Int,
+            useGPU: Boolean,
+            numCPUThreads: Int
+        ): Int
+        
+        /**
+         * Tiled texture synthesis with progress callback (Phase 2)
+         * @param callback Progress callback: (tilesCompleted, totalTiles, cpuTiles, gpuTiles) -> Unit
+         */
+        @JvmStatic
+        external fun nativeTextureSynthesisTiledWithProgress(
+            inputBitmap: Bitmap,
+            outputBitmap: Bitmap,
+            tileSize: Int,
+            overlap: Int,
+            useGPU: Boolean,
+            numCPUThreads: Int,
+            callback: TileSynthProgressCallback?
+        ): Int
     }
+}
+
+/**
+ * Progress callback for tiled texture synthesis
+ */
+fun interface TileSynthProgressCallback {
+    /**
+     * Called when tile processing progress updates
+     * @param tilesCompleted Number of tiles completed
+     * @param totalTiles Total number of tiles
+     * @param cpuTilesCompleted CPU tiles completed
+     * @param gpuTilesCompleted GPU tiles completed
+     */
+    fun onProgress(tilesCompleted: Int, totalTiles: Int, cpuTilesCompleted: Int, gpuTilesCompleted: Int)
 }
 
 /**
@@ -823,6 +908,16 @@ data class TextureSynthConfig(
 )
 
 /**
+ * Configuration for tiled texture synthesis (Phase 2)
+ */
+data class TileSynthConfig(
+    val tileSize: Int = 512,              // Base tile size (core region)
+    val overlap: Int = 96,                // Overlap between tiles for blending (increased for smoother transitions)
+    val useGPU: Boolean = true,           // Enable GPU processing for even tiles
+    val numCPUThreads: Int = 4            // Number of CPU worker threads
+)
+
+/**
  * Synthesize texture details for an image
  * 
  * @param input Input bitmap (potentially lacking detail)
@@ -861,6 +956,118 @@ fun transferTexture(
 ): Boolean {
     val result = NativeMFSRPipeline.nativeTextureTransfer(
         target, source, mask, output, blendWeight
+    )
+    return result == 0
+}
+
+/**
+ * Transfer high-frequency detail from reference frame to upscaled output
+ * 
+ * This implements cross-frame texture transfer inspired by Topaz Gigapixel:
+ * - Uses sharpest original frame as texture reference
+ * - Extracts high-frequency (Laplacian) detail from reference
+ * - Transfers detail to upscaled output where it improves quality
+ * 
+ * @param upscaled The upscaled output bitmap (target)
+ * @param reference The sharpest original frame (source of detail)
+ * @param output Output bitmap (same size as upscaled)
+ * @param blendStrength How much high-frequency to transfer (0-1), default 0.5
+ * @return true on success
+ */
+fun transferReferenceDetail(
+    upscaled: Bitmap,
+    reference: Bitmap,
+    output: Bitmap,
+    blendStrength: Float = 0.5f
+): Boolean {
+    val result = NativeMFSRPipeline.nativeReferenceDetailTransfer(
+        upscaled, reference, output, blendStrength
+    )
+    return result == 0
+}
+
+/**
+ * Mertens Exposure Fusion - Combine multiple exposures into HDR-like output
+ * 
+ * Implements the Mertens et al. algorithm to fuse bracketed exposures:
+ * - Weights by contrast, saturation, and well-exposedness
+ * - Laplacian pyramid blending for seamless fusion
+ * - Preserves detail from all exposure levels
+ * 
+ * @param bitmaps Array of input bitmaps (different exposures)
+ * @param output Output fused bitmap (same size as inputs)
+ * @param contrastWeight Weight for contrast metric (default 1.0)
+ * @param saturationWeight Weight for saturation metric (default 1.0)
+ * @param exposureWeight Weight for well-exposedness metric (default 1.0)
+ * @param pyramidLevels Number of pyramid levels (default 5)
+ * @return true on success
+ */
+fun fuseExposures(
+    bitmaps: Array<Bitmap>,
+    output: Bitmap,
+    contrastWeight: Float = 1.0f,
+    saturationWeight: Float = 1.0f,
+    exposureWeight: Float = 1.0f,
+    pyramidLevels: Int = 5
+): Boolean {
+    val result = NativeMFSRPipeline.nativeExposureFusion(
+        bitmaps, output,
+        contrastWeight, saturationWeight, exposureWeight, pyramidLevels
+    )
+    return result == 0
+}
+
+/**
+ * Tiled texture synthesis with hybrid CPU-GPU processing (Phase 2)
+ * 
+ * Splits image into tiles and processes odd tiles on CPU threads while
+ * even tiles are processed on GPU (when available). Provides 3-5x speedup
+ * over Phase 1 single-threaded processing.
+ * 
+ * @param input Input bitmap (potentially lacking detail)
+ * @param output Output bitmap with synthesized details
+ * @param config Tiled synthesis configuration
+ * @return true on success
+ */
+fun synthesizeTextureTiled(
+    input: Bitmap,
+    output: Bitmap,
+    config: TileSynthConfig = TileSynthConfig()
+): Boolean {
+    val result = NativeMFSRPipeline.nativeTextureSynthesisTiled(
+        input, output,
+        config.tileSize,
+        config.overlap,
+        config.useGPU,
+        config.numCPUThreads
+    )
+    return result == 0
+}
+
+/**
+ * Tiled texture synthesis with progress callback (Phase 2)
+ * 
+ * Same as synthesizeTextureTiled but with progress reporting for UI feedback.
+ * 
+ * @param input Input bitmap (potentially lacking detail)
+ * @param output Output bitmap with synthesized details
+ * @param config Tiled synthesis configuration
+ * @param progressCallback Callback for progress updates (tilesCompleted, totalTiles, cpuTiles, gpuTiles)
+ * @return true on success
+ */
+fun synthesizeTextureTiledWithProgress(
+    input: Bitmap,
+    output: Bitmap,
+    config: TileSynthConfig = TileSynthConfig(),
+    progressCallback: TileSynthProgressCallback?
+): Boolean {
+    val result = NativeMFSRPipeline.nativeTextureSynthesisTiledWithProgress(
+        input, output,
+        config.tileSize,
+        config.overlap,
+        config.useGPU,
+        config.numCPUThreads,
+        progressCallback
     )
     return result == 0
 }

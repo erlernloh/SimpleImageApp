@@ -76,9 +76,12 @@ fun GalleryScreen(
     }
     
     // Trigger export dialog if navigated from viewer with export intent
+    // Use remember to track if we've already handled this export URI to prevent re-triggering
+    var handledExportUri by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(exportPhotoUri) {
-        exportPhotoUri?.let { uri ->
-            val photo = uiState.photos.find { it.uri.toString() == uri }
+        if (exportPhotoUri != null && exportPhotoUri != handledExportUri) {
+            handledExportUri = exportPhotoUri
+            val photo = uiState.photos.find { it.uri.toString() == exportPhotoUri }
             photo?.let { viewModel.showExportDialog(it) }
         }
     }
@@ -187,38 +190,102 @@ fun GalleryScreen(
                                 DropdownMenuItem(
                                     text = { Text("Share") },
                                     onClick = {
-                                        viewModel.shareSelectedPhotos { uris ->
-                                            if (uris.isNotEmpty()) {
-                                                val shareIntent = if (uris.size == 1) {
-                                                    // Single image share
+                                        android.util.Log.d("GalleryScreen", "Share button clicked")
+                                        val selectedIds = uiState.selectedPhotos.toList()
+                                        android.util.Log.d("GalleryScreen", "Selected IDs: $selectedIds")
+                                        val selectedUris = uiState.photos
+                                            .filter { it.id in selectedIds }
+                                            .map { it.uri }
+                                        
+                                        android.util.Log.d("GalleryScreen", "Selected URIs: ${selectedUris.size}")
+                                        showBulkMenu = false
+                                        
+                                        if (selectedUris.isNotEmpty()) {
+                                            try {
+                                                val shareIntent = if (selectedUris.size == 1) {
                                                     Intent(Intent.ACTION_SEND).apply {
                                                         type = "image/*"
-                                                        putExtra(Intent.EXTRA_STREAM, Uri.parse(uris.first()))
+                                                        putExtra(Intent.EXTRA_STREAM, selectedUris.first())
                                                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                                     }
                                                 } else {
-                                                    // Multiple images share
                                                     Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                                                         type = "image/*"
                                                         putParcelableArrayListExtra(
                                                             Intent.EXTRA_STREAM,
-                                                            ArrayList(uris.map { Uri.parse(it) })
+                                                            ArrayList(selectedUris)
                                                         )
                                                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                                     }
                                                 }
+                                                android.util.Log.d("GalleryScreen", "Starting share intent")
                                                 context.startActivity(
-                                                    Intent.createChooser(shareIntent, "Share ${uris.size} photo(s)")
+                                                    Intent.createChooser(shareIntent, "Share ${selectedUris.size} photo(s)")
                                                 )
+                                                android.util.Log.d("GalleryScreen", "Share intent started successfully")
+                                            } catch (e: Exception) {
+                                                android.util.Log.e("GalleryScreen", "Failed to share photos", e)
                                             }
+                                        } else {
+                                            android.util.Log.w("GalleryScreen", "No photos selected for sharing")
                                         }
-                                        showBulkMenu = false
                                     },
                                     leadingIcon = {
                                         Icon(Icons.Default.Share, contentDescription = null)
                                     }
                                 )
                             }
+                        }
+                        
+                        // Share button - direct access
+                        IconButton(
+                            onClick = {
+                                android.util.Log.d("GalleryScreen", "Share icon button clicked")
+                                val selectedIds = uiState.selectedPhotos.toList()
+                                android.util.Log.d("GalleryScreen", "Selected IDs: $selectedIds")
+                                val selectedUris = uiState.photos
+                                    .filter { it.id in selectedIds }
+                                    .map { it.uri }
+                                
+                                android.util.Log.d("GalleryScreen", "Selected URIs: ${selectedUris.size}")
+                                
+                                if (selectedUris.isNotEmpty()) {
+                                    try {
+                                        val shareIntent = if (selectedUris.size == 1) {
+                                            Intent(Intent.ACTION_SEND).apply {
+                                                type = "image/*"
+                                                putExtra(Intent.EXTRA_STREAM, selectedUris.first())
+                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            }
+                                        } else {
+                                            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                                                type = "image/*"
+                                                putParcelableArrayListExtra(
+                                                    Intent.EXTRA_STREAM,
+                                                    ArrayList(selectedUris)
+                                                )
+                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            }
+                                        }
+                                        android.util.Log.d("GalleryScreen", "Starting share intent")
+                                        context.startActivity(
+                                            Intent.createChooser(shareIntent, "Share ${selectedUris.size} photo(s)")
+                                        )
+                                        android.util.Log.d("GalleryScreen", "Share intent started successfully")
+                                    } catch (e: Exception) {
+                                        android.util.Log.e("GalleryScreen", "Failed to share photos", e)
+                                    }
+                                } else {
+                                    android.util.Log.w("GalleryScreen", "No photos selected for sharing")
+                                }
+                            },
+                            enabled = uiState.selectedPhotos.isNotEmpty()
+                        ) {
+                            Icon(
+                                Icons.Default.Share,
+                                contentDescription = "Share Selected",
+                                tint = if (uiState.selectedPhotos.isNotEmpty()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                            )
                         }
                         
                         // Edit Selected button - batch edit multiple photos

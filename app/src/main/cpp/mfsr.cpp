@@ -6,6 +6,7 @@
 
 #include "mfsr.h"
 #include "neon_utils.h"
+#include "deghost_enhance.h"
 #include <cmath>
 #include <algorithm>
 
@@ -273,7 +274,10 @@ void MultiFrameSR::scatterToAccumulator(
                         weight = (1.0f - distX) * (1.0f - distY);
                     }
                     
-                    if (weight > 0.01f) {
+                    // GHOSTING FIX: Only accumulate if confidence is high enough
+                    // Low confidence indicates poor alignment - skip to avoid ghosting
+                    // Increased threshold: 0.3 -> 0.5 -> 0.65 -> 0.75 for maximum ghosting elimination
+                    if (weight > 0.01f && mv.confidence > 0.75f) {
                         accumulator.at(ox, oy).add(pixel, weight);
                     }
                 }
@@ -530,6 +534,32 @@ void MultiFrameSR::process(
     
     // Finalize output image
     finalizeImage(accumulator, result.upscaledImage);
+    
+    // Apply deghosting enhancement for sharper, ghost-free output
+    if (progressCallback) {
+        progressCallback("Applying detail enhancement", 0.97f);
+    }
+    
+    // DISABLED: DeghostEnhancer causes OOM on large upscaled images
+    // Enhancement is already applied per-tile in tiled_pipeline.cpp
+    // Applying again on full 71MP upscaled image exceeds memory limits
+    /*
+    try {
+        DeghostEnhanceConfig enhanceConfig;
+        enhanceConfig.sharpenStrength = 0.6f;      // Multi-scale sharpening
+        enhanceConfig.pyramidLevels = 3;           // 3-level Laplacian pyramid
+        enhanceConfig.contrastStrength = 0.2f;    // Subtle local contrast boost
+        enhanceConfig.edgeBoost = 1.4f;           // Extra sharpening on edges
+        
+        DeghostEnhancer enhancer(enhanceConfig);
+        enhancer.enhance(result.upscaledImage);
+        
+        LOGI("MFSR: Applied deghost enhancement (sharpen=%.2f, contrast=%.2f)",
+             enhanceConfig.sharpenStrength, enhanceConfig.contrastStrength);
+    } catch (const std::exception& e) {
+        LOGW("MFSR: Enhancement failed: %s", e.what());
+    }
+    */
     
     result.averageSubPixelShift = shiftCount > 0 ? totalSubPixelShift / shiftCount : 0;
     result.framesContributed = framesContributed;

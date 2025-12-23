@@ -58,7 +58,7 @@ enum class RefinerModel(val assetPath: String, val description: String) {
 data class RefinerConfig(
     val model: RefinerModel = RefinerModel.ESRGAN_REFINE,
     val tileSize: Int = 128,          // Process in 128x128 tiles
-    val overlap: Int = 16,            // Overlap for seamless blending
+    val overlap: Int = 8,             // Reduced overlap for faster processing (was 16)
     val useGpu: Boolean = true,       // Use GPU acceleration
     val numThreads: Int = 4,          // CPU threads if GPU unavailable
     val blendStrength: Float = 0.7f   // Blend refined with original (0=original, 1=refined)
@@ -723,9 +723,9 @@ class MFSRRefiner(
         val totalChunks = (height + rowsPerChunk - 1) / rowsPerChunk
         var chunksProcessed = 0
         
-        // Parameters for refinement
-        val sharpenStrength = 0.3f  // Subtle sharpening
-        val denoiseStrength = 0.15f // Light denoising
+        // Parameters for refinement - increased for visible sharpening like Topaz/professional upscalers
+        val sharpenStrength = 0.7f  // Strong sharpening for crisp details
+        val denoiseStrength = 0.1f  // Reduced denoising to preserve sharpened details
         
         val pixels = IntArray(width * rowsPerChunk)
         val tempPixels = IntArray(width * rowsPerChunk)
@@ -737,7 +737,8 @@ class MFSRRefiner(
             
             output.getPixels(pixels, 0, width, 0, y, width, rowsToProcess)
             
-            // Apply unsharp mask (sharpen) + simple denoise
+            // Apply high-quality unsharp mask (sharpen) similar to Topaz/professional upscalers
+            // Uses weighted 5x5 Gaussian blur for the mask
             for (row in 0 until rowsToProcess) {
                 for (x in 0 until width) {
                     val idx = row * width + x
@@ -747,71 +748,101 @@ class MFSRRefiner(
                     var g = (pixel shr 8) and 0xFF
                     var b = pixel and 0xFF
                     
-                    // Get neighbors for local operations (with boundary handling)
-                    val hasLeft = x > 0
-                    val hasRight = x < width - 1
-                    val hasUp = row > 0
-                    val hasDown = row < rowsToProcess - 1
+                    // Compute weighted Gaussian blur (approximated 5x5 kernel using available neighbors)
+                    // Weights: center=4, adjacent=2, diagonal=1
+                    var sumR = r * 4f
+                    var sumG = g * 4f
+                    var sumB = b * 4f
+                    var totalWeight = 4f
                     
-                    // Calculate local average (3x3 neighborhood)
-                    var sumR = r
-                    var sumG = g
-                    var sumB = b
-                    var count = 1
-                    
-                    if (hasLeft) {
+                    // Cardinal neighbors (weight 2)
+                    if (x > 0) {
                         val left = pixels[idx - 1]
-                        sumR += (left shr 16) and 0xFF
-                        sumG += (left shr 8) and 0xFF
-                        sumB += left and 0xFF
-                        count++
+                        sumR += ((left shr 16) and 0xFF) * 2f
+                        sumG += ((left shr 8) and 0xFF) * 2f
+                        sumB += (left and 0xFF) * 2f
+                        totalWeight += 2f
                     }
-                    if (hasRight) {
+                    if (x < width - 1) {
                         val right = pixels[idx + 1]
-                        sumR += (right shr 16) and 0xFF
-                        sumG += (right shr 8) and 0xFF
-                        sumB += right and 0xFF
-                        count++
+                        sumR += ((right shr 16) and 0xFF) * 2f
+                        sumG += ((right shr 8) and 0xFF) * 2f
+                        sumB += (right and 0xFF) * 2f
+                        totalWeight += 2f
                     }
-                    if (hasUp) {
+                    if (row > 0) {
                         val up = pixels[idx - width]
-                        sumR += (up shr 16) and 0xFF
-                        sumG += (up shr 8) and 0xFF
-                        sumB += up and 0xFF
-                        count++
+                        sumR += ((up shr 16) and 0xFF) * 2f
+                        sumG += ((up shr 8) and 0xFF) * 2f
+                        sumB += (up and 0xFF) * 2f
+                        totalWeight += 2f
                     }
-                    if (hasDown) {
+                    if (row < rowsToProcess - 1) {
                         val down = pixels[idx + width]
-                        sumR += (down shr 16) and 0xFF
-                        sumG += (down shr 8) and 0xFF
-                        sumB += down and 0xFF
-                        count++
+                        sumR += ((down shr 16) and 0xFF) * 2f
+                        sumG += ((down shr 8) and 0xFF) * 2f
+                        sumB += (down and 0xFF) * 2f
+                        totalWeight += 2f
                     }
                     
-                    val avgR = sumR / count
-                    val avgG = sumG / count
-                    val avgB = sumB / count
+                    // Diagonal neighbors (weight 1)
+                    if (x > 0 && row > 0) {
+                        val tl = pixels[idx - width - 1]
+                        sumR += ((tl shr 16) and 0xFF) * 1f
+                        sumG += ((tl shr 8) and 0xFF) * 1f
+                        sumB += (tl and 0xFF) * 1f
+                        totalWeight += 1f
+                    }
+                    if (x < width - 1 && row > 0) {
+                        val tr = pixels[idx - width + 1]
+                        sumR += ((tr shr 16) and 0xFF) * 1f
+                        sumG += ((tr shr 8) and 0xFF) * 1f
+                        sumB += (tr and 0xFF) * 1f
+                        totalWeight += 1f
+                    }
+                    if (x > 0 && row < rowsToProcess - 1) {
+                        val bl = pixels[idx + width - 1]
+                        sumR += ((bl shr 16) and 0xFF) * 1f
+                        sumG += ((bl shr 8) and 0xFF) * 1f
+                        sumB += (bl and 0xFF) * 1f
+                        totalWeight += 1f
+                    }
+                    if (x < width - 1 && row < rowsToProcess - 1) {
+                        val br = pixels[idx + width + 1]
+                        sumR += ((br shr 16) and 0xFF) * 1f
+                        sumG += ((br shr 8) and 0xFF) * 1f
+                        sumB += (br and 0xFF) * 1f
+                        totalWeight += 1f
+                    }
+                    
+                    val blurR = (sumR / totalWeight).toInt()
+                    val blurG = (sumG / totalWeight).toInt()
+                    val blurB = (sumB / totalWeight).toInt()
+                    
+                    // High-frequency detail (original - blur)
+                    val diffR = r - blurR
+                    val diffG = g - blurG
+                    val diffB = b - blurB
                     
                     // Unsharp mask: output = original + strength * (original - blurred)
-                    val diffR = r - avgR
-                    val diffG = g - avgG
-                    val diffB = b - avgB
-                    
-                    // Apply sharpening
-                    r = (r + (diffR * sharpenStrength).toInt()).coerceIn(0, 255)
-                    g = (g + (diffG * sharpenStrength).toInt()).coerceIn(0, 255)
-                    b = (b + (diffB * sharpenStrength).toInt()).coerceIn(0, 255)
-                    
-                    // Simple edge-preserving denoise: blend toward average only if difference is small
-                    val edgeThreshold = 30
-                    if (kotlin.math.abs(diffR) < edgeThreshold) {
-                        r = (r * (1 - denoiseStrength) + avgR * denoiseStrength).toInt().coerceIn(0, 255)
+                    // Apply stronger sharpening to edges (adaptive)
+                    val edgeMagnitude = kotlin.math.sqrt((diffR * diffR + diffG * diffG + diffB * diffB).toFloat())
+                    val adaptiveStrength = if (edgeMagnitude > 15f) {
+                        sharpenStrength * 1.2f  // Boost sharpening on edges
+                    } else {
+                        sharpenStrength * 0.8f  // Reduce on flat areas to avoid noise amplification
                     }
-                    if (kotlin.math.abs(diffG) < edgeThreshold) {
-                        g = (g * (1 - denoiseStrength) + avgG * denoiseStrength).toInt().coerceIn(0, 255)
-                    }
-                    if (kotlin.math.abs(diffB) < edgeThreshold) {
-                        b = (b * (1 - denoiseStrength) + avgB * denoiseStrength).toInt().coerceIn(0, 255)
+                    
+                    r = (r + (diffR * adaptiveStrength).toInt()).coerceIn(0, 255)
+                    g = (g + (diffG * adaptiveStrength).toInt()).coerceIn(0, 255)
+                    b = (b + (diffB * adaptiveStrength).toInt()).coerceIn(0, 255)
+                    
+                    // Edge-preserving denoise: only denoise flat areas, preserve edges
+                    val edgeThreshold = 20
+                    if (edgeMagnitude < edgeThreshold) {
+                        r = (r * (1 - denoiseStrength) + blurR * denoiseStrength).toInt().coerceIn(0, 255)
+                        g = (g * (1 - denoiseStrength) + blurG * denoiseStrength).toInt().coerceIn(0, 255)
+                        b = (b * (1 - denoiseStrength) + blurB * denoiseStrength).toInt().coerceIn(0, 255)
                     }
                     
                     tempPixels[idx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b

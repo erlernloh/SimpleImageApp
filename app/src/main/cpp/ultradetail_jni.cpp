@@ -16,6 +16,8 @@
 #include "rolling_shutter.h"
 #include "kalman_fusion.h"
 #include "texture_synthesis.h"
+#include "texture_synthesis_tiled.h"
+#include "exposure_fusion.h"
 
 using namespace ultradetail;
 
@@ -2086,6 +2088,568 @@ Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeTextureTransfer(
     AndroidBitmap_unlockPixels(env, outputBitmap);
     
     LOGI("TextureTransfer: %dx%d complete", width, height);
+    
+    return 0;
+}
+
+/**
+ * Transfer high-frequency detail from reference frame to upscaled output
+ * 
+ * This implements cross-frame texture transfer:
+ * 1. Upscale reference to match output size
+ * 2. Extract high-frequency (Laplacian) from upscaled reference
+ * 3. Blend high-frequency into output where it improves detail
+ * 
+ * @param upscaledBitmap The upscaled output (target)
+ * @param referenceBitmap The sharpest original frame (source of detail)
+ * @param outputBitmap Output bitmap (same size as upscaled)
+ * @param blendStrength How much high-frequency to transfer (0-1)
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeReferenceDetailTransfer(
+    JNIEnv* env,
+    jclass clazz,
+    jobject upscaledBitmap,
+    jobject referenceBitmap,
+    jobject outputBitmap,
+    jfloat blendStrength
+) {
+    AndroidBitmapInfo upInfo, refInfo, outInfo;
+    void* upPixels;
+    void* refPixels;
+    void* outPixels;
+    
+    AndroidBitmap_getInfo(env, upscaledBitmap, &upInfo);
+    AndroidBitmap_getInfo(env, referenceBitmap, &refInfo);
+    AndroidBitmap_getInfo(env, outputBitmap, &outInfo);
+    
+    AndroidBitmap_lockPixels(env, upscaledBitmap, &upPixels);
+    AndroidBitmap_lockPixels(env, referenceBitmap, &refPixels);
+    AndroidBitmap_lockPixels(env, outputBitmap, &outPixels);
+    
+    int outWidth = upInfo.width;
+    int outHeight = upInfo.height;
+    int refWidth = refInfo.width;
+    int refHeight = refInfo.height;
+    
+    LOGI("ReferenceDetailTransfer: upscaled=%dx%d, ref=%dx%d, blend=%.2f",
+         outWidth, outHeight, refWidth, refHeight, blendStrength);
+    
+    // Calculate scale factor
+    float scaleX = (float)outWidth / refWidth;
+    float scaleY = (float)outHeight / refHeight;
+    
+    uint8_t* upSrc = static_cast<uint8_t*>(upPixels);
+    uint8_t* refSrc = static_cast<uint8_t*>(refPixels);
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    
+    // First pass: copy upscaled to output
+    memcpy(dst, upSrc, outHeight * outInfo.stride);
+    
+    // Second pass: extract and transfer high-frequency from reference
+    // Use Laplacian (center - neighbors) as high-frequency
+    const int kernelRadius = 1;
+    
+    int patchesTransferred = 0;
+    float totalDetailAdded = 0.0f;
+    
+    for (int y = kernelRadius; y < outHeight - kernelRadius; ++y) {
+        uint8_t* outRow = dst + y * outInfo.stride;
+        
+        for (int x = kernelRadius; x < outWidth - kernelRadius; ++x) {
+            // Map output position to reference position
+            float refX = x / scaleX;
+            float refY = y / scaleY;
+            int rx = (int)refX;
+            int ry = (int)refY;
+            
+            if (rx < kernelRadius || rx >= refWidth - kernelRadius ||
+                ry < kernelRadius || ry >= refHeight - kernelRadius) {
+                continue;
+            }
+            
+            // Compute Laplacian (high-frequency) at reference position
+            // Laplacian = 4*center - top - bottom - left - right
+            uint8_t* refCenter = refSrc + ry * refInfo.stride + rx * 4;
+            uint8_t* refTop = refSrc + (ry-1) * refInfo.stride + rx * 4;
+            uint8_t* refBot = refSrc + (ry+1) * refInfo.stride + rx * 4;
+            uint8_t* refLeft = refSrc + ry * refInfo.stride + (rx-1) * 4;
+            uint8_t* refRight = refSrc + ry * refInfo.stride + (rx+1) * 4;
+            
+            float lapR = 4.0f * refCenter[0] - refTop[0] - refBot[0] - refLeft[0] - refRight[0];
+            float lapG = 4.0f * refCenter[1] - refTop[1] - refBot[1] - refLeft[1] - refRight[1];
+            float lapB = 4.0f * refCenter[2] - refTop[2] - refBot[2] - refLeft[2] - refRight[2];
+            
+            // Compute magnitude of high-frequency
+            float lapMag = sqrtf(lapR*lapR + lapG*lapG + lapB*lapB) / 255.0f;
+            
+            // Only transfer if reference has significant high-frequency
+            if (lapMag > 0.05f) {
+                // Compute Laplacian at output position
+                uint8_t* outCenter = outRow + x * 4;
+                uint8_t* outTop = dst + (y-1) * outInfo.stride + x * 4;
+                uint8_t* outBot = dst + (y+1) * outInfo.stride + x * 4;
+                uint8_t* outLeft = outRow + (x-1) * 4;
+                uint8_t* outRight = outRow + (x+1) * 4;
+                
+                float outLapR = 4.0f * outCenter[0] - outTop[0] - outBot[0] - outLeft[0] - outRight[0];
+                float outLapG = 4.0f * outCenter[1] - outTop[1] - outBot[1] - outLeft[1] - outRight[1];
+                float outLapB = 4.0f * outCenter[2] - outTop[2] - outBot[2] - outLeft[2] - outRight[2];
+                
+                float outLapMag = sqrtf(outLapR*outLapR + outLapG*outLapG + outLapB*outLapB) / 255.0f;
+                
+                // Transfer high-frequency if reference has more detail
+                if (lapMag > outLapMag * 1.2f) {
+                    // Scale Laplacian by scale factor (detail gets spread over more pixels)
+                    float scaledLapR = lapR / scaleX;
+                    float scaledLapG = lapG / scaleX;
+                    float scaledLapB = lapB / scaleX;
+                    
+                    // Adaptive blend based on detail difference
+                    float detailRatio = (lapMag - outLapMag) / (lapMag + 0.01f);
+                    float adaptiveBlend = blendStrength * detailRatio;
+                    
+                    // Add high-frequency to output
+                    int idx = x * 4;
+                    float newR = outRow[idx] + adaptiveBlend * scaledLapR;
+                    float newG = outRow[idx+1] + adaptiveBlend * scaledLapG;
+                    float newB = outRow[idx+2] + adaptiveBlend * scaledLapB;
+                    
+                    outRow[idx] = (uint8_t)fmaxf(0, fminf(255, newR));
+                    outRow[idx+1] = (uint8_t)fmaxf(0, fminf(255, newG));
+                    outRow[idx+2] = (uint8_t)fmaxf(0, fminf(255, newB));
+                    
+                    patchesTransferred++;
+                    totalDetailAdded += adaptiveBlend * lapMag;
+                }
+            }
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, upscaledBitmap);
+    AndroidBitmap_unlockPixels(env, referenceBitmap);
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    float avgDetail = patchesTransferred > 0 ? totalDetailAdded / patchesTransferred : 0;
+    LOGI("ReferenceDetailTransfer: %d patches transferred, avg detail=%.4f", 
+         patchesTransferred, avgDetail);
+    
+    return 0;
+}
+
+/**
+ * Tiled texture synthesis with hybrid CPU-GPU processing (Phase 2)
+ * 
+ * @param inputBitmap Input bitmap
+ * @param outputBitmap Output bitmap (must be same size)
+ * @param tileSize Base tile size (core region)
+ * @param overlap Overlap between tiles
+ * @param useGPU Enable GPU processing for even tiles
+ * @param numCPUThreads Number of CPU worker threads
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeTextureSynthesisTiled(
+    JNIEnv* env,
+    jclass clazz,
+    jobject inputBitmap,
+    jobject outputBitmap,
+    jint tileSize,
+    jint overlap,
+    jboolean useGPU,
+    jint numCPUThreads
+) {
+    AndroidBitmapInfo inInfo, outInfo;
+    void* inPixels;
+    void* outPixels;
+    
+    if (AndroidBitmap_getInfo(env, inputBitmap, &inInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("TiledTextureSynth: Failed to get bitmap info");
+        return -1;
+    }
+    
+    if (AndroidBitmap_lockPixels(env, inputBitmap, &inPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("TiledTextureSynth: Failed to lock pixels");
+        return -2;
+    }
+    
+    int width = inInfo.width;
+    int height = inInfo.height;
+    
+    // Convert to RGBImage
+    RGBImage input;
+    input.resize(width, height);
+    
+    uint8_t* src = static_cast<uint8_t*>(inPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = src + y * inInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            int idx = x * 4;
+            input.at(x, y) = RGBPixel(
+                row[idx] / 255.0f,
+                row[idx + 1] / 255.0f,
+                row[idx + 2] / 255.0f
+            );
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, inputBitmap);
+    
+    // Configure tiled synthesis
+    TileSynthConfig config;
+    config.tileSize = tileSize;
+    config.overlap = overlap;
+    config.useGPU = useGPU;
+    config.numCPUThreads = numCPUThreads;
+    config.mode = TileScheduleMode::ALTERNATING;
+    
+    // Phase 1 optimizations in base params
+    // Optimized parameters based on analysis:
+    // - Lower variance threshold to process more regions (was 0.01f)
+    // - Increase search radius for better patch matching (was 20)
+    config.synthParams.patchSize = 7;
+    config.synthParams.searchRadius = 32;
+    config.synthParams.blendWeight = 0.4f;
+    config.synthParams.varianceThreshold = 0.003f;
+    
+    // Run tiled synthesis
+    TiledTextureSynthProcessor processor(config);
+    TextureSynthResult result = processor.synthesize(input);
+    
+    if (!result.success) {
+        AndroidBitmap_unlockPixels(env, outputBitmap);
+        LOGE("TiledTextureSynth: Synthesis failed");
+        return -3;
+    }
+    
+    // Copy to output
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            const RGBPixel& p = result.synthesized.at(x, y);
+            int idx = x * 4;
+            row[idx] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("TiledTextureSynth: %dx%d, patches=%d, avgDetail=%.3f, GPU=%s",
+         width, height, result.patchesProcessed, result.avgDetailAdded,
+         processor.isGPUAvailable() ? "yes" : "no");
+    
+    return 0;
+}
+
+/**
+ * Tiled texture synthesis with progress callback
+ * 
+ * @param inputBitmap Input bitmap
+ * @param outputBitmap Output bitmap (same size as input)
+ * @param tileSize Base tile size
+ * @param overlap Overlap between tiles
+ * @param useGPU Enable GPU processing for even tiles
+ * @param numCPUThreads Number of CPU worker threads
+ * @param callback Progress callback object
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeTextureSynthesisTiledWithProgress(
+    JNIEnv* env,
+    jclass clazz,
+    jobject inputBitmap,
+    jobject outputBitmap,
+    jint tileSize,
+    jint overlap,
+    jboolean useGPU,
+    jint numCPUThreads,
+    jobject callback
+) {
+    AndroidBitmapInfo inInfo, outInfo;
+    void* inPixels;
+    void* outPixels;
+    
+    if (AndroidBitmap_getInfo(env, inputBitmap, &inInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("TiledTextureSynth: Failed to get bitmap info");
+        return -1;
+    }
+    
+    if (AndroidBitmap_lockPixels(env, inputBitmap, &inPixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("TiledTextureSynth: Failed to lock pixels");
+        return -2;
+    }
+    
+    int width = inInfo.width;
+    int height = inInfo.height;
+    
+    // Convert to RGBImage
+    RGBImage input;
+    input.resize(width, height);
+    
+    uint8_t* src = static_cast<uint8_t*>(inPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = src + y * inInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            int idx = x * 4;
+            input.at(x, y) = RGBPixel(
+                row[idx] / 255.0f,
+                row[idx + 1] / 255.0f,
+                row[idx + 2] / 255.0f
+            );
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, inputBitmap);
+    
+    // Setup callback if provided
+    jclass callbackClass = nullptr;
+    jmethodID onProgressMethod = nullptr;
+    jobject globalCallback = nullptr;
+    
+    if (callback != nullptr) {
+        callbackClass = env->GetObjectClass(callback);
+        onProgressMethod = env->GetMethodID(callbackClass, "onProgress", "(IIII)V");
+        globalCallback = env->NewGlobalRef(callback);
+    }
+    
+    // Configure tiled synthesis
+    TileSynthConfig config;
+    config.tileSize = tileSize;
+    config.overlap = overlap;
+    config.useGPU = useGPU;
+    config.numCPUThreads = numCPUThreads;
+    config.mode = TileScheduleMode::ALTERNATING;
+    
+    // Phase 1 optimizations in base params
+    // Optimized parameters based on analysis:
+    // - Lower variance threshold to process more regions (was 0.01f)
+    // - Increase search radius for better patch matching (was 20)
+    config.synthParams.patchSize = 7;
+    config.synthParams.searchRadius = 32;
+    config.synthParams.blendWeight = 0.4f;
+    config.synthParams.varianceThreshold = 0.003f;
+    
+    // Store JNI env and callback for progress reporting
+    // Note: We need to use a thread-safe approach since callbacks may come from worker threads
+    JavaVM* jvm = nullptr;
+    env->GetJavaVM(&jvm);
+    
+    // Set up progress callback that calls back to Java
+    if (globalCallback != nullptr && onProgressMethod != nullptr) {
+        config.progressCallback = [jvm, globalCallback, onProgressMethod](int completed, int total, float avgDetail) {
+            JNIEnv* callbackEnv = nullptr;
+            bool needsDetach = false;
+            
+            jint getEnvResult = jvm->GetEnv((void**)&callbackEnv, JNI_VERSION_1_6);
+            if (getEnvResult == JNI_EDETACHED) {
+                if (jvm->AttachCurrentThread(&callbackEnv, nullptr) == JNI_OK) {
+                    needsDetach = true;
+                } else {
+                    LOGE("TiledTextureSynth: Failed to attach thread for callback");
+                    return;
+                }
+            } else if (getEnvResult != JNI_OK) {
+                LOGE("TiledTextureSynth: Failed to get JNI env for callback");
+                return;
+            }
+            
+            // Log every 10 tiles for debugging
+            if (completed % 10 == 0 || completed == total) {
+                LOGD("TiledTextureSynth: Progress callback: %d/%d tiles", completed, total);
+            }
+            
+            // Call the Java callback - pass completed, total, and split CPU/GPU (for now all CPU)
+            callbackEnv->CallVoidMethod(globalCallback, onProgressMethod, 
+                                        completed, total, completed, 0);
+            
+            // Check for Java exceptions
+            if (callbackEnv->ExceptionCheck()) {
+                LOGE("TiledTextureSynth: Exception in Java callback");
+                callbackEnv->ExceptionDescribe();
+                callbackEnv->ExceptionClear();
+            }
+            
+            if (needsDetach) {
+                jvm->DetachCurrentThread();
+            }
+        };
+    } else {
+        LOGW("TiledTextureSynth: No progress callback provided");
+    }
+    
+    // Run tiled synthesis
+    TiledTextureSynthProcessor processor(config);
+    TextureSynthResult result = processor.synthesize(input);
+    
+    // Clean up global reference
+    if (globalCallback != nullptr) {
+        env->DeleteGlobalRef(globalCallback);
+    }
+    
+    if (!result.success) {
+        AndroidBitmap_unlockPixels(env, outputBitmap);
+        LOGE("TiledTextureSynth: Synthesis failed");
+        return -3;
+    }
+    
+    // Copy to output
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            const RGBPixel& p = result.synthesized.at(x, y);
+            int idx = x * 4;
+            row[idx] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("TiledTextureSynth: %dx%d, patches=%d, avgDetail=%.3f, GPU=%s",
+         width, height, result.patchesProcessed, result.avgDetailAdded,
+         processor.isGPUAvailable() ? "yes" : "no");
+    
+    return 0;
+}
+
+/**
+ * Mertens Exposure Fusion - Combine multiple exposures into HDR-like output
+ * 
+ * @param bitmapArray Array of input bitmaps (different exposures)
+ * @param outputBitmap Output fused bitmap
+ * @param contrastWeight Weight for contrast metric (default 1.0)
+ * @param saturationWeight Weight for saturation metric (default 1.0)
+ * @param exposureWeight Weight for well-exposedness metric (default 1.0)
+ * @param pyramidLevels Number of pyramid levels (default 5)
+ * @return 0 on success, negative on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_imagedit_app_ultradetail_NativeMFSRPipeline_nativeExposureFusion(
+    JNIEnv* env,
+    jclass clazz,
+    jobjectArray bitmapArray,
+    jobject outputBitmap,
+    jfloat contrastWeight,
+    jfloat saturationWeight,
+    jfloat exposureWeight,
+    jint pyramidLevels
+) {
+    jsize numImages = env->GetArrayLength(bitmapArray);
+    
+    if (numImages < 2) {
+        LOGE("ExposureFusion: Need at least 2 images, got %d", numImages);
+        return -1;
+    }
+    
+    LOGI("ExposureFusion: Fusing %d images", numImages);
+    
+    // Load all input images
+    std::vector<RGBImage> images;
+    images.reserve(numImages);
+    
+    AndroidBitmapInfo info;
+    int width = 0, height = 0;
+    
+    for (jsize i = 0; i < numImages; ++i) {
+        jobject bitmap = env->GetObjectArrayElement(bitmapArray, i);
+        
+        AndroidBitmapInfo bmpInfo;
+        void* pixels;
+        
+        if (AndroidBitmap_getInfo(env, bitmap, &bmpInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+            AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+            LOGE("ExposureFusion: Failed to access bitmap %d", i);
+            env->DeleteLocalRef(bitmap);
+            return -2;
+        }
+        
+        if (i == 0) {
+            width = bmpInfo.width;
+            height = bmpInfo.height;
+        } else if (bmpInfo.width != width || bmpInfo.height != height) {
+            LOGE("ExposureFusion: Size mismatch at image %d", i);
+            AndroidBitmap_unlockPixels(env, bitmap);
+            env->DeleteLocalRef(bitmap);
+            return -3;
+        }
+        
+        // Convert to RGBImage
+        RGBImage img;
+        img.resize(width, height);
+        
+        uint8_t* src = static_cast<uint8_t*>(pixels);
+        for (int y = 0; y < height; ++y) {
+            uint8_t* row = src + y * bmpInfo.stride;
+            for (int x = 0; x < width; ++x) {
+                int idx = x * 4;
+                img.at(x, y) = RGBPixel(
+                    row[idx] / 255.0f,
+                    row[idx + 1] / 255.0f,
+                    row[idx + 2] / 255.0f
+                );
+            }
+        }
+        
+        images.push_back(img);
+        
+        AndroidBitmap_unlockPixels(env, bitmap);
+        env->DeleteLocalRef(bitmap);
+    }
+    
+    // Configure fusion
+    ExposureFusionConfig config;
+    config.contrastWeight = contrastWeight;
+    config.saturationWeight = saturationWeight;
+    config.exposureWeight = exposureWeight;
+    config.pyramidLevels = pyramidLevels;
+    
+    // Perform fusion
+    ExposureFusionProcessor processor(config);
+    ExposureFusionResult result = processor.fuse(images);
+    
+    if (!result.success) {
+        LOGE("ExposureFusion: Fusion failed");
+        return -4;
+    }
+    
+    // Copy to output bitmap
+    AndroidBitmapInfo outInfo;
+    void* outPixels;
+    
+    if (AndroidBitmap_getInfo(env, outputBitmap, &outInfo) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        AndroidBitmap_lockPixels(env, outputBitmap, &outPixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        LOGE("ExposureFusion: Failed to access output bitmap");
+        return -5;
+    }
+    
+    uint8_t* dst = static_cast<uint8_t*>(outPixels);
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = dst + y * outInfo.stride;
+        for (int x = 0; x < width; ++x) {
+            const RGBPixel& p = result.fused.at(x, y);
+            int idx = x * 4;
+            row[idx] = static_cast<uint8_t>(clamp(p.r * 255.0f, 0.0f, 255.0f));
+            row[idx + 1] = static_cast<uint8_t>(clamp(p.g * 255.0f, 0.0f, 255.0f));
+            row[idx + 2] = static_cast<uint8_t>(clamp(p.b * 255.0f, 0.0f, 255.0f));
+            row[idx + 3] = 255;
+        }
+    }
+    
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+    
+    LOGI("ExposureFusion: Complete - %dx%d from %d images", width, height, numImages);
     
     return 0;
 }

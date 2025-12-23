@@ -18,6 +18,7 @@
 
 #include "common.h"
 #include <vector>
+#include <functional>
 
 namespace ultradetail {
 
@@ -34,6 +35,12 @@ struct TexturePatch {
 };
 
 /**
+ * Progress callback for texture synthesis
+ * Parameters: (processed, total, avgDetail)
+ */
+using TextureSynthProgressCallback = std::function<void(int, int, float)>;
+
+/**
  * Texture synthesis parameters
  */
 struct TextureSynthParams {
@@ -45,6 +52,7 @@ struct TextureSynthParams {
     float edgeWeight = 0.3f;      // Weight for edge-guided synthesis
     bool useMultiScale = true;    // Multi-scale synthesis
     int numScales = 3;            // Number of scales for multi-scale
+    TextureSynthProgressCallback progressCallback = nullptr;  // Optional progress callback
 };
 
 /**
@@ -130,6 +138,12 @@ public:
         const RGBImage& source,
         const GrayImage& mask
     );
+    
+    /**
+     * Analyze image quality to determine if texture synthesis is beneficial
+     * Returns a score from 0.0 (no synthesis needed) to 1.0 (synthesis highly beneficial)
+     */
+    static float analyzeImageQuality(const RGBImage& input);
     
     /**
      * Update parameters

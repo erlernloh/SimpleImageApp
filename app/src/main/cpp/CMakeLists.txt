@@ -42,6 +42,13 @@ set(ULTRADETAIL_SOURCES
     # Phase 3 enhancements
     kalman_fusion.cpp
     texture_synthesis.cpp
+    # Phase 2 texture synthesis optimization
+    texture_synthesis_tiled.cpp
+    gpu_compute.cpp
+    # Advanced features
+    exposure_fusion.cpp
+    # Ghosting prevention and detail enhancement
+    deghost_enhance.cpp
 )
 
 # Header files
@@ -68,6 +75,13 @@ set(ULTRADETAIL_HEADERS
     # Phase 3 enhancements
     kalman_fusion.h
     texture_synthesis.h
+    # Phase 2 texture synthesis optimization
+    texture_synthesis_tiled.h
+    gpu_compute.h
+    # Advanced features
+    exposure_fusion.h
+    # Ghosting prevention and detail enhancement
+    deghost_enhance.h
 )
 
 # Create shared library
@@ -77,12 +91,16 @@ add_library(ultradetail SHARED ${ULTRADETAIL_SOURCES})
 find_library(log-lib log)
 find_library(jnigraphics-lib jnigraphics)
 find_library(android-lib android)
+find_library(egl-lib EGL)
+find_library(gles3-lib GLESv3)
 
 # Link libraries
 target_link_libraries(ultradetail
     ${log-lib}
     ${jnigraphics-lib}
     ${android-lib}
+    ${egl-lib}
+    ${gles3-lib}
 )
 
 # Include directories

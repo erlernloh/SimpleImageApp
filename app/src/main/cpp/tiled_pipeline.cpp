@@ -6,10 +6,15 @@
 
 #include "tiled_pipeline.h"
 #include "neon_utils.h"
+#include "deghost_enhance.h"
 #include <android/log.h>
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <vector>
 
 // Use logging macros from common.h
 #undef LOG_TAG
@@ -194,10 +199,14 @@ float TiledMFSRPipeline::computeRobustnessWeight(
     const RGBPixel& reference,
     float flowConfidence
 ) {
-    // Fix #4: Adaptive robustness weighting
-    // Instead of fixed threshold, adapt based on flow confidence (proxy for motion)
-    // Low confidence (high motion) → more aggressive rejection (lower threshold)
-    // High confidence (low motion) → gentler rejection (higher threshold)
+    // GHOSTING FIX: More aggressive rejection of misaligned pixels
+    // Low confidence indicates poor alignment - reject more aggressively
+    
+    // Early rejection for very low confidence (likely ghosting source)
+    // Increased: 0.3 -> 0.5 -> 0.65 -> 0.75 for maximum ghosting elimination
+    if (flowConfidence < 0.75f) {
+        return 0.0f;  // Completely reject poorly aligned pixels
+    }
     
     // Compute color difference
     float dr = pixel.r - reference.r;
@@ -205,12 +214,18 @@ float TiledMFSRPipeline::computeRobustnessWeight(
     float db = pixel.b - reference.b;
     float colorDiff = std::sqrt(dr*dr + dg*dg + db*db);
     
+    // GHOSTING FIX: Reject pixels with large color differences (indicates misalignment)
+    // Threshold of 0.15 in normalized space (0-1) = ~38 in 0-255 space
+    if (colorDiff > 0.15f) {
+        return flowConfidence * 0.1f;  // Heavily down-weight misaligned pixels
+    }
+    
     float weight = flowConfidence;
     
     // Adaptive threshold: base + adjustment based on flow confidence
     // flowConfidence near 1.0 → use higher threshold (gentler, Huber-like)
     // flowConfidence near 0.0 → use lower threshold (more aggressive, Tukey-like)
-    float adaptiveThreshold = config_.robustnessThreshold * (0.5f + 0.5f * flowConfidence);
+    float adaptiveThreshold = config_.robustnessThreshold * (0.3f + 0.7f * flowConfidence);
     
     switch (config_.robustness) {
         case TilePipelineConfig::RobustnessMethod::TUKEY:
@@ -466,47 +481,66 @@ void TiledMFSRPipeline::processTile(
         }
         
         // Choose alignment method based on configuration
-        if (config_.alignmentMethod == TilePipelineConfig::AlignmentMethod::DENSE_OPTICAL_FLOW) {
-            // Original dense Lucas-Kanade optical flow
-            flowProcessor_->setReference(grayTileCrops[referenceIndex]);
-            DenseFlowResult flowResult = flowProcessor_->computeFlow(grayTileCrops[i], gyroInit);
+        // Use mutex to protect shared alignment resources during multi-threaded processing
+        FlowField computedFlow;
+        bool flowValid = false;
+        float flowMagnitude = 0.0f;
+        
+        {
+            std::lock_guard<std::mutex> lock(alignmentMutex_);
             
-            if (flowResult.isValid) {
-                tileFlows[i] = std::move(flowResult.flowField);
-                totalFlow += flowResult.averageFlow;
+            if (config_.alignmentMethod == TilePipelineConfig::AlignmentMethod::DENSE_OPTICAL_FLOW) {
+                // Original dense Lucas-Kanade optical flow
+                flowProcessor_->setReference(grayTileCrops[referenceIndex]);
+                DenseFlowResult flowResult = flowProcessor_->computeFlow(grayTileCrops[i], gyroInit);
+                
+                if (flowResult.isValid) {
+                    computedFlow = std::move(flowResult.flowField);
+                    flowMagnitude = flowResult.averageFlow;
+                    flowValid = true;
+                }
+            } else {
+                // Fix #5 & #1: Hybrid alignment (gyro + phase correlation)
+                // Much faster and more robust for global translations
+                computedFlow = hybridAligner_->computeAlignment(
+                    grayTileCrops[referenceIndex],
+                    grayTileCrops[i],
+                    gyroPtr,
+                    config_.useLocalRefinement
+                );
+                flowValid = true;
+            }
+        }
+        
+        if (flowValid) {
+            tileFlows[i] = std::move(computedFlow);
+            
+            if (config_.alignmentMethod == TilePipelineConfig::AlignmentMethod::DENSE_OPTICAL_FLOW) {
+                totalFlow += flowMagnitude;
                 validFlows++;
             } else {
-                // Zero flow fallback
-                tileFlows[i].resize(tileCrops[i].width, tileCrops[i].height);
-                for (int y = 0; y < tileFlows[i].height; ++y) {
-                    for (int x = 0; x < tileFlows[i].width; ++x) {
-                        tileFlows[i].at(x, y) = FlowVector(0, 0, 0.5f);
+                // Compute average flow for statistics
+                float sumFlow = 0.0f;
+                int count = 0;
+                for (int y = 0; y < tileFlows[i].height; y += 4) {
+                    for (int x = 0; x < tileFlows[i].width; x += 4) {
+                        const FlowVector& fv = tileFlows[i].at(x, y);
+                        sumFlow += fv.magnitude();
+                        count++;
                     }
+                }
+                if (count > 0) {
+                    totalFlow += sumFlow / count;
+                    validFlows++;
                 }
             }
         } else {
-            // Fix #5 & #1: Hybrid alignment (gyro + phase correlation)
-            // Much faster and more robust for global translations
-            tileFlows[i] = hybridAligner_->computeAlignment(
-                grayTileCrops[referenceIndex],
-                grayTileCrops[i],
-                gyroPtr,
-                config_.useLocalRefinement
-            );
-            
-            // Compute average flow for statistics
-            float sumFlow = 0.0f;
-            int count = 0;
-            for (int y = 0; y < tileFlows[i].height; y += 4) {
-                for (int x = 0; x < tileFlows[i].width; x += 4) {
-                    const FlowVector& fv = tileFlows[i].at(x, y);
-                    sumFlow += fv.magnitude();
-                    count++;
+            // Zero flow fallback
+            tileFlows[i].resize(tileCrops[i].width, tileCrops[i].height);
+            for (int y = 0; y < tileFlows[i].height; ++y) {
+                for (int x = 0; x < tileFlows[i].width; ++x) {
+                    tileFlows[i].at(x, y) = FlowVector(0, 0, 0.5f);
                 }
-            }
-            if (count > 0) {
-                totalFlow += sumFlow / count;
-                validFlows++;
             }
         }
     }
@@ -584,8 +618,8 @@ void TiledMFSRPipeline::processTile(
                     robustWeight = computeRobustnessWeight(pixel, refCrop.at(x, y), fv.confidence);
                 }
                 
-                // Mitchell-Netravali splatting (4x4 kernel) - more stable than Lanczos-3
-                // under optical flow alignment errors. Less ringing, better for imprecise shifts.
+                // Mitchell-Netravali splatting (4x4 kernel) - high quality interpolation
+                // Provides better detail reconstruction than bilinear
                 const int kernelRadius = 2;  // Mitchell-Netravali has support [-2, 2]
                 const int kernelSize = kernelRadius * 2;  // 4x4 kernel
                 int x0 = static_cast<int>(std::floor(dstX)) - kernelRadius + 1;
@@ -778,30 +812,95 @@ void TiledMFSRPipeline::process(
         }
     }
     
-    // Process each tile
-    float totalFlow = 0.0f;
-    int successfulTiles = 0;
+    // Process tiles in parallel using multiple CPU threads
+    // This significantly speeds up processing on multi-core devices
+    const int numThreads = std::max(2, static_cast<int>(std::thread::hardware_concurrency()));
+    LOGI("Processing %d tiles using %d threads", totalTiles, numThreads);
+    
+    // Pre-allocate tile results to avoid race conditions
+    std::vector<TileResult> tileResults(totalTiles);
+    std::atomic<int> tilesCompleted(0);
+    
+    // Worker function for processing tiles
+    // NOTE: Do NOT call progressCallback from worker threads - they are not attached to JVM
+    // and calling JNI functions (like NewStringUTF) will crash the app
+    auto processTileWorker = [&](int startIdx, int endIdx) {
+        for (int i = startIdx; i < endIdx; ++i) {
+            auto tileStart = std::chrono::high_resolution_clock::now();
+            
+            processTile(frames, grayFrames, tiles[i], referenceIndex, gyroHomographies, tileResults[i]);
+            
+            auto tileEnd = std::chrono::high_resolution_clock::now();
+            float tileMs = std::chrono::duration<float, std::milli>(tileEnd - tileStart).count();
+            
+            int completed = ++tilesCompleted;
+            LOGD("Tile %d/%d processed in %.1f ms (thread)", completed, totalTiles, tileMs);
+        }
+    };
+    
+    // Distribute tiles across threads
+    std::vector<std::thread> threads;
+    int tilesPerThread = (totalTiles + numThreads - 1) / numThreads;
+    
+    for (int t = 0; t < numThreads; ++t) {
+        int startIdx = t * tilesPerThread;
+        int endIdx = std::min(startIdx + tilesPerThread, totalTiles);
+        if (startIdx < totalTiles) {
+            threads.emplace_back(processTileWorker, startIdx, endIdx);
+        }
+    }
+    
+    // Poll for progress updates (safe way to report progress from JNI thread)
+    // Loop until all tiles are completed
+    int lastReported = 0;
+    while (tilesCompleted < totalTiles) {
+        // Sleep briefly to avoid busy waiting
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        
+        int current = tilesCompleted.load();
+        if (current > lastReported) {
+            if (progressCallback) {
+                float progress = static_cast<float>(current) / totalTiles;
+                // Map to 0.1 - 0.8 range
+                float overallProgress = 0.1f + (progress * 0.7f);
+                progressCallback(current, totalTiles, "Processing MFSR tiles", overallProgress);
+            }
+            lastReported = current;
+        }
+    }
+    
+    // Wait for all threads to complete (clean up)
+    for (auto& thread : threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    
+    // Report progress after all tiles are processed (safe - we're on the JNI-attached thread)
+    if (progressCallback) {
+        progressCallback(totalTiles, totalTiles, "Blending tiles", 0.80f);
+    }
+    
+    // Blend results sequentially (must be done after all tiles are processed)
+    // This is thread-safe since we're the only thread now
+    float finalTotalFlow = 0.0f;
+    int finalSuccessfulTiles = 0;
+    int finalFailedTiles = 0;
     
     for (int i = 0; i < totalTiles; ++i) {
-        if (progressCallback) {
-            float progress = static_cast<float>(i) / totalTiles;
-            progressCallback(i, totalTiles, "Processing MFSR tiles", progress);
-        }
-        
-        TileResult tileResult;
-        processTile(frames, grayFrames, tiles[i], referenceIndex, gyroHomographies, tileResult);
-        
-        if (tileResult.success) {
-            blendTileToOutput(tileResult.outputTile, tiles[i], result.outputImage, weightMap);
-            totalFlow += tileResult.averageFlow;
-            successfulTiles++;
+        if (tileResults[i].success) {
+            blendTileToOutput(tileResults[i].outputTile, tiles[i], result.outputImage, weightMap);
+            finalTotalFlow += tileResults[i].averageFlow;
+            finalSuccessfulTiles++;
         } else {
-            result.tilesFailed++;
-            LOGW("Tile %d failed, coverage=%.1f%%", i, tileResult.coverage * 100);
+            finalFailedTiles++;
+            LOGW("Tile %d failed, coverage=%.1f%%", i, tileResults[i].coverage * 100);
         }
-        
-        // Tile memory is released here when tileResult goes out of scope
     }
+    
+    result.tilesFailed = finalFailedTiles;
+    
+    LOGI("Parallel processing complete: %d/%d tiles successful", finalSuccessfulTiles, totalTiles);
     
     // Normalize output by weight map
     for (int y = 0; y < outHeight; ++y) {
@@ -957,6 +1056,26 @@ void TiledMFSRPipeline::process(
         }
     }
     
+    // DISABLED: Laplacian pyramid sharpening causes OOM on full 71MP output
+    // The unsharp mask above already provides adequate sharpening
+    // Multi-scale pyramid on 9728x7296 image creates ~300MB+ of temporary buffers
+    /*
+    try {
+        DeghostEnhanceConfig enhanceConfig;
+        enhanceConfig.sharpenStrength = 0.5f;      // Multi-scale Laplacian sharpening
+        enhanceConfig.pyramidLevels = 3;           // 3-level pyramid for detail
+        enhanceConfig.contrastStrength = 0.15f;    // Subtle local contrast
+        enhanceConfig.edgeBoost = 1.3f;            // Extra boost on edges
+        
+        DeghostEnhancer enhancer(enhanceConfig);
+        enhancer.applyLaplacianSharpening(result.outputImage);
+        
+        LOGI("TiledPipeline: Applied Laplacian pyramid enhancement");
+    } catch (const std::exception& e) {
+        LOGW("TiledPipeline: Enhancement failed: %s", e.what());
+    }
+    */
+    
     auto endTime = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
     
@@ -964,13 +1083,13 @@ void TiledMFSRPipeline::process(
     result.inputHeight = height;
     result.outputWidth = outWidth;
     result.outputHeight = outHeight;
-    result.tilesProcessed = successfulTiles;
-    result.averageFlow = successfulTiles > 0 ? totalFlow / successfulTiles : 0.0f;
+    result.tilesProcessed = finalSuccessfulTiles;
+    result.averageFlow = finalSuccessfulTiles > 0 ? finalTotalFlow / finalSuccessfulTiles : 0.0f;
     result.processingTimeMs = static_cast<float>(duration.count());
-    result.success = successfulTiles > 0;
+    result.success = finalSuccessfulTiles > 0;
     
     LOGI("MFSR complete: %d/%d tiles, avgFlow=%.2f, time=%.1fs",
-         successfulTiles, totalTiles, result.averageFlow, result.processingTimeMs / 1000.0f);
+         finalSuccessfulTiles, totalTiles, result.averageFlow, result.processingTimeMs / 1000.0f);
     
     if (progressCallback) {
         progressCallback(totalTiles, totalTiles, "MFSR complete", 1.0f);

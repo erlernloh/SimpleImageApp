@@ -63,7 +63,10 @@ data class BurstCaptureConfig(
     val minFrameDiversity: Float = 0.3f,      // Minimum sub-pixel shift threshold (pixels)
     val adaptiveInterval: Boolean = false,     // Adjust timing based on detected motion
     val intervalRangeMs: IntRange = 30..200,   // Range for adaptive interval
-    val diversityCheckEnabled: Boolean = false // Enable real-time diversity validation
+    val diversityCheckEnabled: Boolean = false, // Enable real-time diversity validation
+    // Exposure bracketing for detail capture
+    val useExposureBracketing: Boolean = false, // Vary exposure across frames for HDR+detail
+    val exposureBracketStops: Float = 1.0f      // EV variation (±1 stop = 2x range)
 ) {
     init {
         require(frameCount in 2..20) { "Frame count must be between 2 and 20" }
@@ -80,15 +83,17 @@ data class BurstCaptureConfig(
             diversityCheckEnabled = false
         )
         
-        /** Enhanced config for ULTRA preset (12+ frames, diversity check) */
+        /** Enhanced config for ULTRA preset (12+ frames, diversity check, exposure bracketing) */
         fun forUltraPreset() = BurstCaptureConfig(
-            frameCount = 12,
-            frameIntervalMs = 100,
+            frameCount = 10,  // Reduced to 10 for faster capture with bracketing
+            frameIntervalMs = 80,  // Faster interval since exposure changes add delay
             captureQuality = CaptureQuality.HIGH_QUALITY,
             minFrameDiversity = 0.3f,
             adaptiveInterval = true,
-            intervalRangeMs = 30..200,
-            diversityCheckEnabled = true
+            intervalRangeMs = 30..150,
+            diversityCheckEnabled = true,
+            useExposureBracketing = true,  // Enable exposure variation for HDR detail
+            exposureBracketStops = 1.5f    // ±1.5 EV for better shadow/highlight recovery
         )
     }
 }
@@ -181,6 +186,9 @@ data class GyroSample(
 
 /**
  * Captured frame data with associated gyro samples
+ * 
+ * Supports streaming memory management - call release() after processing
+ * to free the ByteBuffer memory immediately rather than waiting for GC.
  */
 data class CapturedFrame(
     val yPlane: ByteBuffer,
@@ -192,8 +200,35 @@ data class CapturedFrame(
     val width: Int,
     val height: Int,
     val timestamp: Long,
-    val gyroSamples: List<GyroSample> = emptyList()  // Gyro samples during this frame's exposure
+    val gyroSamples: List<GyroSample> = emptyList(),  // Gyro samples during this frame's exposure
+    @Volatile var isReleased: Boolean = false  // Track if frame has been released
 ) {
+    /**
+     * Release the frame's memory buffers.
+     * Call this after the frame has been processed to reduce memory pressure.
+     * 
+     * Note: DirectByteBuffers are not immediately freed by this call,
+     * but marking as released prevents further use and helps GC prioritize.
+     */
+    fun release() {
+        if (!isReleased) {
+            isReleased = true
+            // Clear buffer references to help GC
+            // Note: DirectByteBuffer memory is freed when the buffer is GC'd
+            // We can't explicitly free it, but clearing helps signal to GC
+            yPlane.clear()
+            uPlane.clear()
+            vPlane.clear()
+        }
+    }
+    
+    /**
+     * Get estimated memory usage in bytes
+     */
+    fun getMemoryUsageBytes(): Long {
+        return yPlane.capacity().toLong() + uPlane.capacity() + vPlane.capacity()
+    }
+    
     companion object {
         /**
          * Create from CameraX Image
@@ -255,7 +290,8 @@ data class HighQualityCapturedFrame(
     val timestamp: Long,
     val gyroSamples: List<GyroSample> = emptyList(),
     val exposureTimeNs: Long = 0,
-    val iso: Int = 0
+    val iso: Int = 0,
+    val exposureCompensation: Int = 0  // EV compensation index (0 = base, negative = darker, positive = brighter)
 ) {
     /**
      * Recycle the bitmap to free memory
@@ -272,7 +308,11 @@ data class HighQualityCapturedFrame(
  */
 sealed class BurstCaptureState {
     object Idle : BurstCaptureState()
-    data class Capturing(val framesCollected: Int, val totalFrames: Int) : BurstCaptureState()
+    data class Capturing(
+        val framesCollected: Int, 
+        val totalFrames: Int,
+        val exposureInfo: String = ""  // e.g., "EV+1.5 | 1/60s"
+    ) : BurstCaptureState()
     data class Complete(val frames: List<CapturedFrame>) : BurstCaptureState()
     data class HighQualityComplete(val frames: List<HighQualityCapturedFrame>) : BurstCaptureState()
     data class Error(val message: String) : BurstCaptureState()
@@ -430,9 +470,13 @@ class BurstCaptureController(
                         val frameWithGyro = frame.copy(gyroSamples = gyroSamples)
                         
                         frames.add(frameWithGyro)
-                        _captureState.value = BurstCaptureState.Capturing(index + 1, config.frameCount)
                         
-                        Log.d(TAG, "Captured frame ${index + 1}/${config.frameCount} with ${gyroSamples.size} gyro samples")
+                        // Get exposure info for display (preview mode doesn't use bracketing)
+                        val exposureInfo = "Frame ${index + 1}/${config.frameCount}"
+                        
+                        _captureState.value = BurstCaptureState.Capturing(index + 1, config.frameCount, exposureInfo)
+                        
+                        Log.d(TAG, "Captured frame ${index + 1}/${config.frameCount} with ${gyroSamples.size} gyro samples [$exposureInfo]")
                     }
                     
                     // Small delay between frames
@@ -546,16 +590,53 @@ class BurstCaptureController(
                 lockExposureAndFocus()
             }
             
-            // Capture frames sequentially with adaptive timing
+            // Capture frames sequentially with adaptive timing and optional exposure bracketing
             var currentInterval = config.frameIntervalMs
             var lowDiversityWarningShown = false
             
+            // Calculate exposure compensation pattern if bracketing is enabled
+            val exposurePattern = if (config.useExposureBracketing) {
+                calculateExposureBracketPattern(config.frameCount, config.exposureBracketStops)
+            } else {
+                IntArray(config.frameCount) { 0 } // All frames at base exposure
+            }
+            
             repeat(config.frameCount) { index ->
-                val frame = captureHighQualityFrame()
+                val exposureComp = exposurePattern[index]
+                val frame = captureHighQualityFrame(exposureComp)
                 if (frame != null) {
                     frames.add(frame)
-                    _captureState.value = BurstCaptureState.Capturing(index + 1, config.frameCount)
-                    Log.d(TAG, "HQ Captured frame ${index + 1}/${config.frameCount}: ${frame.width}x${frame.height}")
+                    
+                    // Format exposure info for display with actual camera metadata
+                    val evStops = exposureComp / 3.0f  // Convert index to EV stops (1/3 stop increments)
+                    val evText = when {
+                        exposureComp == 0 -> "Base"
+                        exposureComp > 0 -> "EV+%.1f".format(evStops)
+                        else -> "EV%.1f".format(evStops)
+                    }
+                    
+                    // Format shutter speed (e.g., "1/60s")
+                    val shutterText = if (frame.exposureTimeNs > 0) {
+                        val exposureSec = frame.exposureTimeNs / 1_000_000_000.0
+                        if (exposureSec >= 1.0) {
+                            "%.1fs".format(exposureSec)
+                        } else {
+                            "1/%d".format((1.0 / exposureSec).toInt())
+                        }
+                    } else ""
+                    
+                    // Format ISO
+                    val isoText = if (frame.iso > 0) "ISO ${frame.iso}" else ""
+                    
+                    // Combine all info
+                    val exposureInfo = buildString {
+                        append(evText)
+                        if (shutterText.isNotEmpty()) append(" | $shutterText")
+                        if (isoText.isNotEmpty()) append(" | $isoText")
+                    }
+                    
+                    _captureState.value = BurstCaptureState.Capturing(index + 1, config.frameCount, exposureInfo)
+                    Log.d(TAG, "HQ Captured frame ${index + 1}/${config.frameCount}: ${frame.width}x${frame.height} [$exposureInfo]")
                     
                     // Check diversity after a few frames (for ULTRA preset)
                     if (config.diversityCheckEnabled && index >= 2 && !lowDiversityWarningShown) {
@@ -627,10 +708,20 @@ class BurstCaptureController(
     }
     
     /**
-     * Capture a single high-quality frame using ImageCapture
+     * Capture a single high-quality frame using ImageCapture with optional exposure compensation
      */
-    private suspend fun captureHighQualityFrame(): HighQualityCapturedFrame? {
+    private suspend fun captureHighQualityFrame(exposureCompensation: Int = 0): HighQualityCapturedFrame? {
         val capture = imageCapture ?: return null
+        
+        // Apply exposure compensation for this frame
+        try {
+            camera?.cameraControl?.setExposureCompensationIndex(exposureCompensation)
+            if (exposureCompensation != 0) {
+                delay(80) // Wait longer for non-base exposures to stabilize
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to set exposure compensation: ${e.message}")
+        }
         
         return suspendCancellableCoroutine { continuation ->
             // Use elapsedRealtimeNanos which matches sensor event timestamps (both use CLOCK_BOOTTIME)
@@ -641,6 +732,10 @@ class BurstCaptureController(
                 object : ImageCapture.OnImageCapturedCallback() {
                     override fun onCaptureSuccess(image: ImageProxy) {
                         try {
+                            // Extract EXIF metadata from image
+                            val exifExposureTimeNs = extractExposureTimeNs(image)
+                            val exifIso = extractIso(image)
+                            
                             val bitmap = imageProxyToBitmap(image)
                             if (bitmap != null) {
                                 val gyroSamples = getGyroSamplesForFrame(timestamp)
@@ -649,7 +744,10 @@ class BurstCaptureController(
                                     width = bitmap.width,
                                     height = bitmap.height,
                                     timestamp = timestamp,
-                                    gyroSamples = gyroSamples
+                                    gyroSamples = gyroSamples,
+                                    exposureTimeNs = exifExposureTimeNs,
+                                    iso = exifIso,
+                                    exposureCompensation = exposureCompensation
                                 )
                                 continuation.resume(frame)
                             } else {
@@ -705,6 +803,53 @@ class BurstCaptureController(
         } catch (e: Exception) {
             Log.e(TAG, "Failed to convert ImageProxy to Bitmap", e)
             null
+        }
+    }
+    
+    /**
+     * Extract exposure time in nanoseconds from ImageProxy EXIF data
+     */
+    private fun extractExposureTimeNs(image: ImageProxy): Long {
+        return try {
+            val buffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            buffer.rewind() // Reset buffer position for later use
+            
+            val inputStream = java.io.ByteArrayInputStream(bytes)
+            val exif = androidx.exifinterface.media.ExifInterface(inputStream)
+            
+            // ExposureTime is in seconds as a rational (e.g., "1/60")
+            val exposureTimeStr = exif.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME)
+            if (exposureTimeStr != null) {
+                val exposureTimeSec = exposureTimeStr.toDoubleOrNull() ?: 0.0
+                (exposureTimeSec * 1_000_000_000).toLong()
+            } else {
+                0L
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to extract exposure time from EXIF: ${e.message}")
+            0L
+        }
+    }
+    
+    /**
+     * Extract ISO sensitivity from ImageProxy EXIF data
+     */
+    private fun extractIso(image: ImageProxy): Int {
+        return try {
+            val buffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            buffer.rewind() // Reset buffer position for later use
+            
+            val inputStream = java.io.ByteArrayInputStream(bytes)
+            val exif = androidx.exifinterface.media.ExifInterface(inputStream)
+            
+            exif.getAttributeInt(androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, 0)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to extract ISO from EXIF: ${e.message}")
+            0
         }
     }
     
@@ -836,7 +981,65 @@ class BurstCaptureController(
      */
     private fun unlockExposureAndFocus() {
         camera?.cameraControl?.cancelFocusAndMetering()
-        Log.d(TAG, "AE/AF unlocked")
+        // Reset exposure compensation to 0
+        camera?.cameraControl?.setExposureCompensationIndex(0)
+        Log.d(TAG, "AE/AF unlocked, exposure reset")
+    }
+    
+    /**
+     * Calculate exposure bracket pattern for HDR detail capture
+     * 
+     * Pattern distributes exposures across the bracket range:
+     * - 12 frames with ±1 EV: [0, +1, -1, +2, -2, 0, +1, -1, +2, -2, 0, 0]
+     * 
+     * This ensures:
+     * - Multiple frames at each exposure level
+     * - Base exposure frames for reference
+     * - Overexposed frames capture shadow detail
+     * - Underexposed frames preserve highlight detail
+     */
+    private fun calculateExposureBracketPattern(frameCount: Int, bracketStops: Float): IntArray {
+        // Convert EV stops to exposure compensation index
+        // Most cameras support ±2 EV in 1/3 or 1/2 stop increments
+        // Index typically ranges from -6 to +6 (representing ±2 EV in 1/3 stops)
+        val maxIndex = (bracketStops * 3).toInt().coerceIn(1, 6) // 1 EV = 3 steps in 1/3 stop increments
+        
+        // IMPROVED PATTERN: Prioritize base exposure frames for alignment,
+        // intersperse with varied exposures for detail capture
+        // Pattern: 0, -, +, 0, --, ++, 0, -, +, 0 (base frames at positions 0, 3, 6, 9)
+        // This ensures good alignment reference while capturing HDR detail
+        
+        return when {
+            frameCount <= 3 -> {
+                // Simple 3-frame bracket: [0, -, +] - base first for reference
+                intArrayOf(0, -maxIndex, maxIndex)
+            }
+            frameCount <= 5 -> {
+                // 5-frame bracket: [0, -, +, 0, --] - two base frames
+                intArrayOf(0, -maxIndex, maxIndex, 0, -maxIndex * 2 / 3)
+            }
+            frameCount <= 7 -> {
+                // 7-frame bracket with multiple base exposures for alignment
+                intArrayOf(0, -maxIndex, maxIndex, 0, -maxIndex * 2 / 3, maxIndex * 2 / 3, 0)
+            }
+            else -> {
+                // 8+ frames: optimized pattern for MFSR + HDR
+                // More base exposure frames = better alignment
+                // Varied exposures = better detail in shadows/highlights
+                val pattern = mutableListOf<Int>()
+                
+                // Pattern repeats: [0, -, +] with increasing EV variation
+                val evLevels = listOf(0, -maxIndex / 2, maxIndex / 2, 0, -maxIndex, maxIndex, 0, -maxIndex * 2 / 3, maxIndex * 2 / 3, 0)
+                
+                for (i in 0 until frameCount) {
+                    pattern.add(evLevels[i % evLevels.size])
+                }
+                
+                pattern.toIntArray()
+            }
+        }.also { pattern ->
+            Log.d(TAG, "Exposure bracket pattern (${frameCount} frames, ±${bracketStops}EV): ${pattern.joinToString()}")
+        }
     }
     
     /**

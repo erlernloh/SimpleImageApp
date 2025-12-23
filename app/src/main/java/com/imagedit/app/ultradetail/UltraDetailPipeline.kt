@@ -42,6 +42,7 @@ sealed class PipelineState {
     data class ProcessingBurst(val stage: ProcessingStage, val progress: Float, val message: String) : PipelineState()
     data class ApplyingSuperResolution(val tilesProcessed: Int, val totalTiles: Int) : PipelineState()
     data class ProcessingMFSR(val tilesProcessed: Int, val totalTiles: Int, val progress: Float) : PipelineState()
+    data class SynthesizingTexture(val tilesProcessed: Int, val totalTiles: Int, val cpuTiles: Int, val gpuTiles: Int) : PipelineState()
     data class RefiningMFSR(val tilesProcessed: Int, val totalTiles: Int) : PipelineState()
     data class Complete(val result: Bitmap, val processingTimeMs: Long, val framesUsed: Int = 0) : PipelineState()
     data class Error(val message: String, val fallbackResult: Bitmap?) : PipelineState()
@@ -72,6 +73,11 @@ class UltraDetailPipeline(
     private val context: Context
 ) : AutoCloseable {
     
+    init {
+        // Initialize MemoryStats with context for device RAM detection
+        MemoryStats.initialize(context)
+    }
+    
     private val _state = MutableStateFlow<PipelineState>(PipelineState.Idle)
     val state: StateFlow<PipelineState> = _state.asStateFlow()
     
@@ -88,15 +94,46 @@ class UltraDetailPipeline(
     // private val alignmentWatermark = AlignmentWatermark()
     private val rgbQualityMask = RGBQualityMask()
     
+    // Scene classification for content-aware processing
+    private val sceneClassifier = SceneClassifier(context)
+    
+    // Device capability and thermal management
+    private val deviceCapabilityManager = DeviceCapabilityManager(context)
+    private var deviceCapability: DeviceCapability = DeviceCapability.unknown()
+    private var currentQualityTier: QualityTier = QualityTier.QUALITY
+    
+    // Thermal state for UI feedback
+    private val _thermalState = MutableStateFlow<ThermalStatus?>(null)
+    val thermalState: StateFlow<ThermalStatus?> = _thermalState.asStateFlow()
+    
     private var currentJob: Job? = null
     
     /**
      * Initialize the pipeline
      * 
      * @param preset Processing preset to use
+     * @param qualityTier Optional quality tier override (for multi-tier presets)
      */
-    suspend fun initialize(preset: UltraDetailPreset): Boolean = withContext(Dispatchers.IO) {
+    suspend fun initialize(
+        preset: UltraDetailPreset,
+        qualityTier: QualityTier? = null
+    ): Boolean = withContext(Dispatchers.IO) {
         try {
+            // Detect device capabilities for adaptive processing
+            deviceCapability = deviceCapabilityManager.detectCapabilities()
+            currentQualityTier = qualityTier ?: when (preset) {
+                UltraDetailPreset.FAST -> QualityTier.QUICK
+                UltraDetailPreset.BALANCED -> QualityTier.QUALITY
+                UltraDetailPreset.MAX -> QualityTier.QUALITY
+                UltraDetailPreset.ULTRA -> QualityTier.MAXIMUM
+            }
+            
+            // Get device-adjusted configuration
+            val tierConfig = deviceCapability.getQualityTierConfig(currentQualityTier)
+            Log.i(TAG, "Device: ${deviceCapability.tier}, Quality: ${currentQualityTier}, " +
+                       "Tiles: ${tierConfig.tileSize}, Frames: ${tierConfig.frameCount}, " +
+                       "Threads: ${tierConfig.threadCount}")
+            
             // Check if native library is available
             if (!NativeMFSRPipeline.isAvailable() && (preset == UltraDetailPreset.MAX || preset == UltraDetailPreset.ULTRA)) {
                 Log.e(TAG, "Native MFSR library not available: ${NativeMFSRPipeline.getLoadError()}")
@@ -109,13 +146,18 @@ class UltraDetailPipeline(
             
             // MAX and ULTRA presets use dedicated MFSR pipeline for high-quality processing
             if (preset == UltraDetailPreset.MAX || preset == UltraDetailPreset.ULTRA) {
-                // Initialize tile-based MFSR pipeline
-                // Use larger tiles (512x512) to reduce processing time
-                // This reduces tile count from ~20 to ~6 for a 1280x960 image
+                // Initialize tile-based MFSR pipeline with device-adaptive tile size
+                val adaptiveTileSize = tierConfig.tileSize
+                // Adaptive MFSR overlap based on preset
+                val mfsrOverlap = when (preset) {
+                    UltraDetailPreset.FAST -> adaptiveTileSize / 16      // Minimal overlap for speed
+                    UltraDetailPreset.BALANCED -> adaptiveTileSize / 12  // Balanced
+                    UltraDetailPreset.MAX, UltraDetailPreset.ULTRA -> adaptiveTileSize / 8  // Quality overlap
+                }
                 mfsrPipeline = NativeMFSRPipeline.create(NativeMFSRConfig(
-                    tileWidth = 512,
-                    tileHeight = 512,
-                    overlap = 64,
+                    tileWidth = adaptiveTileSize,
+                    tileHeight = adaptiveTileSize,
+                    overlap = mfsrOverlap,
                     scaleFactor = 2,
                     robustness = MFSRRobustness.HUBER,  // HUBER is gentler than TUKEY for low-diversity frames
                     robustnessThreshold = 0.8f,  // Higher threshold allows more frame contribution
@@ -127,7 +169,7 @@ class UltraDetailPipeline(
                     try {
                         mfsrRefiner = MFSRRefiner(context, RefinerConfig(
                             tileSize = 128,
-                            overlap = 16,
+                            overlap = 8,  // Optimized: reduced from 16 for faster processing
                             useGpu = true,
                             blendStrength = 0.7f
                         ))
@@ -465,26 +507,35 @@ class UltraDetailPipeline(
         scope: CoroutineScope
     ): UltraDetailResult? = withContext(Dispatchers.Default) {
         
+        Log.i(TAG, "processHighQuality: ENTRY - frames.size=${frames.size}, preset=$preset")
+        
         val startTime = System.currentTimeMillis()
         
         if (frames.isEmpty()) {
+            Log.e(TAG, "processHighQuality: No frames to process!")
             _state.value = PipelineState.Error("No frames to process", null)
             return@withContext null
         }
         
+        Log.d(TAG, "processHighQuality: Checking mfsrPipeline initialization")
         // Initialize MFSR pipeline for high-quality processing
         if (mfsrPipeline == null) {
+            Log.w(TAG, "processHighQuality: mfsrPipeline is null, calling initialize()")
             if (!initialize(preset)) {
+                Log.e(TAG, "processHighQuality: Failed to initialize pipeline")
                 _state.value = PipelineState.Error("Failed to initialize pipeline", null)
                 return@withContext null
             }
+            Log.i(TAG, "processHighQuality: Pipeline initialized successfully")
+        } else {
+            Log.d(TAG, "processHighQuality: Pipeline already initialized")
         }
         
         try {
             val width = frames[0].width
             val height = frames[0].height
             
-            Log.i(TAG, "Processing ${frames.size} HQ frames (${width}x${height}) with preset $preset")
+            Log.i(TAG, "processHighQuality: Processing ${frames.size} HQ frames (${width}x${height}) with preset $preset")
             
             // Analyze frame diversity
             val frameDiversity = analyzeFrameDiversityHQ(frames)
@@ -499,15 +550,32 @@ class UltraDetailPipeline(
             val bestFrameIndex = selectBestFrameHQ(frames)
             Log.i(TAG, "Selected HQ reference frame: $bestFrameIndex")
             
+            // Lucky Imaging: Select only the sharpest frames (astronomy technique)
+            // Discard motion-blurred frames to improve fusion quality
+            _state.value = PipelineState.ProcessingBurst(
+                ProcessingStage.ALIGNING_FRAMES, 0.05f, "Selecting sharpest frames..."
+            )
+            val originalReferenceFrame = frames[bestFrameIndex]
+            val luckyFrames = selectLuckyFrames(frames, bestFrameIndex, preset)
+            Log.i(TAG, "Lucky Imaging: Selected ${luckyFrames.size}/${frames.size} sharpest frames")
+            
+            // Find new index of reference frame in filtered list
+            val newReferenceIndex = luckyFrames.indexOf(originalReferenceFrame)
+            if (newReferenceIndex == -1) {
+                Log.e(TAG, "CRITICAL: Reference frame not found in lucky frames! This should never happen.")
+                return@withContext null
+            }
+            Log.d(TAG, "Reference frame remapped: $bestFrameIndex -> $newReferenceIndex")
+            
             // Determine processing path based on preset
             return@withContext when (preset) {
                 UltraDetailPreset.FAST, UltraDetailPreset.BALANCED -> {
                     // Simple merge - use best frame with optional averaging
-                    processHQSimpleMerge(frames, bestFrameIndex, preset, startTime)
+                    processHQSimpleMerge(luckyFrames, newReferenceIndex, preset, startTime)
                 }
                 UltraDetailPreset.MAX, UltraDetailPreset.ULTRA -> {
                     // Full MFSR processing with Bitmaps
-                    processHQWithMFSR(frames, bestFrameIndex, preset, startTime)
+                    processHQWithMFSR(luckyFrames, newReferenceIndex, preset, startTime)
                 }
             }
             
@@ -560,6 +628,56 @@ class UltraDetailPipeline(
     }
     
     /**
+     * Single-frame enhancement fallback when MFSR can't be used (memory constraints)
+     * Uses the refiner model if available, otherwise returns the original frame
+     */
+    private suspend fun processSingleFrameEnhancement(
+        frame: HighQualityCapturedFrame,
+        preset: UltraDetailPreset,
+        startTime: Long
+    ): UltraDetailResult {
+        Log.i(TAG, "║ Single-frame enhancement mode (memory fallback)")
+        
+        _state.value = PipelineState.ProcessingBurst(
+            ProcessingStage.MERGING_FRAMES, 0.5f, "Enhancing single frame..."
+        )
+        
+        var resultBitmap: Bitmap = frame.bitmap
+        
+        // Try to apply refinement if available (ULTRA preset)
+        if (preset == UltraDetailPreset.ULTRA && mfsrRefiner != null) {
+            try {
+                Log.i(TAG, "║ Applying neural refinement to single frame...")
+                val refined = mfsrRefiner!!.refine(frame.bitmap) { _, _, _ -> }
+                if (refined != null) {
+                    resultBitmap = refined
+                    Log.i(TAG, "║ Neural refinement applied: ${refined.width}x${refined.height}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "║ Neural refinement failed, using original frame", e)
+            }
+        }
+        
+        val processingTime = System.currentTimeMillis() - startTime
+        _state.value = PipelineState.Complete(resultBitmap, processingTime, 1)
+        
+        Log.i(TAG, "║ Single-frame enhancement complete: ${processingTime}ms, ${resultBitmap.width}x${resultBitmap.height}")
+        Log.i(TAG, "═══════════════════════════════════════════════════════════")
+        
+        return UltraDetailResult(
+            bitmap = resultBitmap,
+            processingTimeMs = processingTime,
+            framesUsed = 1,
+            detailTilesCount = 0,
+            srTilesProcessed = 0,
+            preset = preset,
+            mfsrApplied = false,
+            mfsrScaleFactor = 1,
+            mfsrCoveragePercent = 0f  // No MFSR was applied
+        )
+    }
+    
+    /**
      * Full MFSR processing for MAX/ULTRA presets with high-quality frames
      * 
      * Enhanced pipeline with Phase 1-3 modules:
@@ -573,26 +691,141 @@ class UltraDetailPipeline(
         preset: UltraDetailPreset,
         startTime: Long
     ): UltraDetailResult? {
-        val pipeline = mfsrPipeline ?: return null
+        Log.i(TAG, "processHQWithMFSR: ENTRY - frames=${frames.size}, refIndex=$referenceIndex, preset=$preset")
         
+        val pipeline = mfsrPipeline
+        if (pipeline == null) {
+            Log.e(TAG, "processHQWithMFSR: mfsrPipeline is NULL, returning null")
+            return null
+        }
+        
+        Log.d(TAG, "processHQWithMFSR: Pipeline OK, extracting frame dimensions")
         val width = frames[0].width
         val height = frames[0].height
-        val scaleFactor = 2
-        val outputWidth = width * scaleFactor
-        val outputHeight = height * scaleFactor
-        val inputMegapixels = (width * height) / 1_000_000f
+        Log.i(TAG, "processHQWithMFSR: Frame dimensions: ${width}x${height}")
+        
+        // Smart memory management based on device capabilities and available RAM
+        // Goal: Achieve full 2x resolution when possible, gracefully degrade when not
+        val memStats = MemoryStats.current()
+        val inputMegapixels = (width.toLong() * height.toLong()) / 1_000_000f
+        val requestedOutputPixels = width.toLong() * height.toLong() * 4L  // 2x scale = 4x pixels
+        
+        // Estimate memory requirements:
+        // - Input frames: ~4 bytes/pixel × frameCount (bitmaps already loaded)
+        // - Output bitmap: ~4 bytes/pixel × outputPixels
+        // - Native buffers: ~200MB for tile processing
+        // - Safety margin: 200MB for system/GC
+        val inputMemoryMb = (frames.size * width.toLong() * height.toLong() * 4L) / (1024 * 1024)
+        val outputMemoryMb = (requestedOutputPixels * 4L) / (1024 * 1024)
+        val nativeBuffersMb = 200L
+        val safetyMarginMb = 200L
+        val totalRequiredMb = inputMemoryMb + outputMemoryMb + nativeBuffersMb + safetyMarginMb
+        
+        Log.i(TAG, "║ Memory analysis: available=${memStats.availableMemoryMb}MB, " +
+                   "required=${totalRequiredMb}MB (input=${inputMemoryMb}MB, output=${outputMemoryMb}MB)")
+        
+        val scaleFactor: Int
+        val outputWidth: Int
+        val outputHeight: Int
+        var framesToUse = frames
+        
+        when {
+            // Case 1: Enough memory for full resolution
+            memStats.availableMemoryMb >= totalRequiredMb -> {
+                scaleFactor = 2
+                outputWidth = width * scaleFactor
+                outputHeight = height * scaleFactor
+                Log.i(TAG, "║ Memory OK: Full 2x resolution enabled")
+            }
+            
+            // Case 2: Can achieve full resolution by reducing frame count
+            // Fewer frames = less input memory, still get full output resolution
+            memStats.availableMemoryMb >= (outputMemoryMb + nativeBuffersMb + safetyMarginMb + 100) -> {
+                scaleFactor = 2
+                outputWidth = width * scaleFactor
+                outputHeight = height * scaleFactor
+                
+                // Calculate how many frames we can afford
+                val availableForFrames = memStats.availableMemoryMb - outputMemoryMb - nativeBuffersMb - safetyMarginMb
+                val frameMemoryMb = (width.toLong() * height.toLong() * 4L) / (1024 * 1024)
+                val maxFrames = maxOf(3, (availableForFrames / frameMemoryMb).toInt())
+                
+                if (maxFrames < frames.size) {
+                    // Select best frames: reference + frames with most sub-pixel diversity
+                    framesToUse = selectBestFramesForMemory(frames, referenceIndex, maxFrames)
+                    Log.w(TAG, "║ Memory optimization: Reduced frames from ${frames.size} to ${framesToUse.size} for full 2x output")
+                }
+            }
+            
+            // Case 3: Must reduce output resolution to fit in memory
+            else -> {
+                // Calculate max output size that fits in available memory
+                val availableForOutput = memStats.availableMemoryMb - nativeBuffersMb - safetyMarginMb - 100
+                val maxOutputPixels = (availableForOutput * 1024 * 1024) / 4
+                
+                if (maxOutputPixels >= width.toLong() * height.toLong()) {
+                    // Can at least do 1x with multi-frame fusion
+                    val safeScale = kotlin.math.sqrt(maxOutputPixels.toDouble() / (width.toLong() * height.toLong())).toFloat()
+                    if (safeScale >= 1.4f) {
+                        scaleFactor = 2
+                        val downscaleRatio = kotlin.math.sqrt(maxOutputPixels.toDouble() / requestedOutputPixels).toFloat()
+                        outputWidth = ((width * 2) * downscaleRatio).toInt()
+                        outputHeight = ((height * 2) * downscaleRatio).toInt()
+                        // Also reduce frames
+                        framesToUse = selectBestFramesForMemory(frames, referenceIndex, 4)
+                        Log.w(TAG, "║ Memory limit: Output ${outputWidth}x${outputHeight}, ${framesToUse.size} frames")
+                    } else {
+                        scaleFactor = 1
+                        outputWidth = width
+                        outputHeight = height
+                        framesToUse = selectBestFramesForMemory(frames, referenceIndex, 4)
+                        Log.w(TAG, "║ Memory limit: 1x scale with ${framesToUse.size} frames for fusion")
+                    }
+                } else {
+                    // Extreme memory pressure - minimal processing
+                    scaleFactor = 1
+                    outputWidth = width
+                    outputHeight = height
+                    framesToUse = listOf(frames[referenceIndex])
+                    Log.e(TAG, "║ Critical memory: Single frame only")
+                }
+            }
+        }
+        
+        // Use selected frames for processing (may be reduced for memory)
+        // Find new reference index in the reduced frame list
+        val workingFrames = framesToUse
+        val workingRefIndex = if (framesToUse === frames) {
+            referenceIndex
+        } else {
+            // Find the original reference frame in the new list, or use first frame
+            workingFrames.indexOfFirst { it === frames[referenceIndex] }.takeIf { it >= 0 } ?: 0
+        }
+        
         val outputMegapixels = (outputWidth * outputHeight) / 1_000_000f
         
         // Determine if we should use enhanced ULTRA features
         val useEnhancedPipeline = preset == UltraDetailPreset.ULTRA
         
+        // Stage 0: Scene Classification for content-aware processing
+        _state.value = PipelineState.ProcessingBurst(
+            ProcessingStage.ALIGNING_FRAMES, 0.08f, "Analyzing scene content..."
+        )
+        val sceneClassification = sceneClassifier.classify(workingFrames[workingRefIndex].bitmap)
         Log.i(TAG, "═══════════════════════════════════════════════════════════")
         Log.i(TAG, "║ HQ MFSR PIPELINE START")
-        Log.i(TAG, "║ Input: ${width}x${height} (${"%.2f".format(inputMegapixels)}MP) x ${frames.size} frames")
+        Log.i(TAG, "║ Input: ${width}x${height} (${"%.2f".format(inputMegapixels)}MP) x ${workingFrames.size} frames (from ${frames.size})")
         Log.i(TAG, "║ Output: ${outputWidth}x${outputHeight} (${"%.2f".format(outputMegapixels)}MP) @ ${scaleFactor}x scale")
         Log.i(TAG, "║ Preset: $preset, Reference frame: $referenceIndex")
+        Log.i(TAG, "║ Scene: ${sceneClassification.primaryType} (confidence=${"%.2f".format(sceneClassification.confidence)})")
         Log.i(TAG, "║ Enhanced pipeline: $useEnhancedPipeline")
         Log.i(TAG, "═══════════════════════════════════════════════════════════")
+        
+        // MFSR requires at least 2 frames - if we only have 1, use single-frame enhancement
+        if (workingFrames.size < 2) {
+            Log.w(TAG, "║ Single frame mode: MFSR requires 2+ frames, using single-frame enhancement")
+            return processSingleFrameEnhancement(workingFrames[0], preset, startTime)
+        }
         
         // Stage 1: Compute gyro homographies + optional ORB refinement (ULTRA)
         val stage1Start = System.currentTimeMillis()
@@ -600,24 +833,24 @@ class UltraDetailPipeline(
             ProcessingStage.ALIGNING_FRAMES, 0.1f, "Computing alignment..."
         )
         
-        var homographies = computeHomographiesFromHQFrames(frames)
+        var homographies = computeHomographiesFromHQFrames(workingFrames)
         
         // ULTRA: Refine alignment with ORB feature matching + Kalman fusion
-        if (useEnhancedPipeline && frames.size >= 2) {
+        if (useEnhancedPipeline && workingFrames.size >= 2) {
             Log.i(TAG, "║ Stage 1a: ORB feature alignment refinement...")
             val orbConfig = ORBAlignmentConfig(maxKeypoints = 500, ransacThreshold = 3.0f)
-            val refBitmap = frames[referenceIndex].bitmap
+            val refBitmap = workingFrames[workingRefIndex].bitmap
             
             // Collect ORB-based flow measurements for Kalman fusion
             val flowMeasurements = mutableListOf<FlowMeasurementKF>()
             val gyroMeasurements = mutableListOf<GyroMeasurementKF>()
             
             homographies = homographies.mapIndexed { idx, gyroH ->
-                if (idx == referenceIndex) {
+                if (idx == workingRefIndex) {
                     gyroH // Reference stays identity
                 } else {
                     try {
-                        val orbResult = alignWithORB(refBitmap, frames[idx].bitmap, orbConfig)
+                        val orbResult = alignWithORB(refBitmap, workingFrames[idx].bitmap, orbConfig)
                         if (orbResult.success && orbResult.inlierCount > 20) {
                             // Extract translation from ORB homography for Kalman fusion
                             flowMeasurements.add(FlowMeasurementKF(
@@ -645,12 +878,12 @@ class UltraDetailPipeline(
             }
             
             // Stage 1b: Kalman fusion for refined motion estimation
-            if (flowMeasurements.isNotEmpty() && frames.any { it.gyroSamples.isNotEmpty() }) {
+            if (flowMeasurements.isNotEmpty() && workingFrames.any { it.gyroSamples.isNotEmpty() }) {
                 Log.i(TAG, "║ Stage 1b: Kalman fusion for motion refinement...")
                 
                 // Collect all gyro samples
-                frames.forEachIndexed { idx, frame ->
-                    if (idx != referenceIndex) {
+                workingFrames.forEachIndexed { idx, frame ->
+                    if (idx != workingRefIndex) {
                         frame.gyroSamples.forEachIndexed { sIdx, sample ->
                             val dt = if (sIdx > 0) {
                                 (sample.timestamp - frame.gyroSamples[sIdx - 1].timestamp).toFloat() / 1_000_000_000f
@@ -671,7 +904,7 @@ class UltraDetailPipeline(
                     val fusedMotion = kalmanFusion(
                         gyroSamples = gyroMeasurements,
                         flowMeasurements = flowMeasurements,
-                        numFrames = frames.size,
+                        numFrames = workingFrames.size,
                         config = KalmanFusionConfig(gyroWeight = 0.6f, flowWeight = 0.4f)
                     )
                     
@@ -689,13 +922,13 @@ class UltraDetailPipeline(
         
         val stage1Time = System.currentTimeMillis() - stage1Start
         Log.i(TAG, "║ Stage 1: Alignment computed in ${stage1Time}ms")
-        Log.i(TAG, "║   - Homographies: ${homographies.size} (${frames.size} frames)")
+        Log.i(TAG, "║   - Homographies: ${homographies.size} (${workingFrames.size} frames)")
         
         // Stage 1.5: Rolling Shutter Correction (ULTRA only)
-        var correctedFrames = frames
+        var correctedFrames = workingFrames
         var stage15Time = 0L
         
-        if (useEnhancedPipeline && frames.any { it.gyroSamples.isNotEmpty() }) {
+        if (useEnhancedPipeline && workingFrames.any { it.gyroSamples.isNotEmpty() }) {
             val stage15Start = System.currentTimeMillis()
             _state.value = PipelineState.ProcessingBurst(
                 ProcessingStage.ALIGNING_FRAMES, 0.25f, "Correcting rolling shutter..."
@@ -708,7 +941,7 @@ class UltraDetailPipeline(
                 focalLengthPx = 3000f
             )
             
-            correctedFrames = frames.mapIndexed { idx, frame ->
+            correctedFrames = workingFrames.mapIndexed { idx, frame ->
                 if (frame.gyroSamples.isEmpty()) {
                     frame // No gyro data, skip correction
                 } else {
@@ -751,6 +984,46 @@ class UltraDetailPipeline(
             Log.i(TAG, "║ Stage 1.5: Rolling shutter correction completed in ${stage15Time}ms")
         }
         
+        // Stage 1.7: Optional Exposure Fusion (if exposure bracketing was used)
+        // This creates an HDR-like base image before MFSR processing
+        var fusedBase: Bitmap? = null
+        var stage17Time = 0L
+        
+        if (useEnhancedPipeline && workingFrames.size >= 3) {
+            val stage17Start = System.currentTimeMillis()
+            _state.value = PipelineState.ProcessingBurst(
+                ProcessingStage.ALIGNING_FRAMES, 0.25f, "Fusing exposures for HDR detail..."
+            )
+            Log.i(TAG, "║ Stage 1.7: Exposure fusion for HDR detail recovery...")
+            
+            try {
+                val fusedOutput = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val bitmapsToFuse = correctedFrames.map { it.bitmap }.toTypedArray()
+                
+                // Content-aware fusion weights
+                val (contrastW, saturationW, exposureW) = when (sceneClassification.primaryType) {
+                    SceneType.FACE -> Triple(0.8f, 1.2f, 1.0f)  // Preserve skin tones
+                    SceneType.TEXT -> Triple(1.5f, 0.5f, 1.0f)  // Emphasize contrast
+                    SceneType.NATURE -> Triple(1.0f, 1.5f, 1.0f) // Boost colors
+                    SceneType.ARCHITECTURE -> Triple(1.2f, 0.8f, 1.0f) // Edge preservation
+                    SceneType.GENERAL -> Triple(1.0f, 1.0f, 1.0f) // Balanced
+                }
+                
+                if (fuseExposures(bitmapsToFuse, fusedOutput, contrastW, saturationW, exposureW, 5)) {
+                    fusedBase = fusedOutput
+                    Log.i(TAG, "║   - Exposure fusion successful (weights: C=$contrastW, S=$saturationW, E=$exposureW)")
+                } else {
+                    fusedOutput.recycle()
+                    Log.w(TAG, "║   - Exposure fusion failed, using original frames")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "║   - Exposure fusion error: ${e.message}")
+            }
+            
+            stage17Time = System.currentTimeMillis() - stage17Start
+            Log.i(TAG, "║ Stage 1.7: Exposure fusion completed in ${stage17Time}ms")
+        }
+        
         // Stage 2: Compute RGB quality mask for pixel selection
         val stage2Start = System.currentTimeMillis()
         _state.value = PipelineState.ProcessingBurst(
@@ -775,7 +1048,7 @@ class UltraDetailPipeline(
         
         val outputBitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
         Log.i(TAG, "║ Stage 3: Native MFSR processing starting...")
-        Log.i(TAG, "║   - Input frames: ${frames.size}")
+        Log.i(TAG, "║   - Input frames: ${correctedFrames.size}")
         Log.i(TAG, "║   - Output bitmap allocated: ${outputWidth}x${outputHeight}")
         Log.i(TAG, "║   - Quality mask: ${qualityResult.width}x${qualityResult.height} passed to native")
         
@@ -784,7 +1057,7 @@ class UltraDetailPipeline(
         
         val mfsrResult = pipeline.processBitmapsWithQualityMask(
             inputBitmaps = bitmapArray,
-            referenceIndex = referenceIndex,
+            referenceIndex = workingRefIndex,
             homographies = homographies,
             qualityMask = qualityResult.qualityMask,
             maskWidth = qualityResult.width,
@@ -822,7 +1095,7 @@ class UltraDetailPipeline(
             return UltraDetailResult(
                 bitmap = outputBitmap,
                 processingTimeMs = System.currentTimeMillis() - startTime,
-                framesUsed = frames.size,
+                framesUsed = workingFrames.size,
                 detailTilesCount = 0,
                 srTilesProcessed = 0,
                 preset = preset,
@@ -844,6 +1117,32 @@ class UltraDetailPipeline(
             )
             
             try {
+                // Step 0: Reference-based detail transfer (NEW - Topaz Gigapixel inspired)
+                // Use the sharpest original frame to transfer high-frequency detail to upscaled output
+                _state.value = PipelineState.ProcessingBurst(
+                    ProcessingStage.MERGING_FRAMES, 0.82f, "Transferring fine details from reference..."
+                )
+                Log.i(TAG, "║ Stage 3.5-pre: Reference-based detail transfer...")
+                val sharpestFrame = correctedFrames[workingRefIndex].bitmap
+                val refTransferOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+                
+                // Transfer high-frequency detail from sharpest frame
+                // This extracts Laplacian (edges/texture) from reference and blends into upscaled output
+                val refBlendStrength = when (preset) {
+                    UltraDetailPreset.FAST -> 0.3f
+                    UltraDetailPreset.BALANCED -> 0.4f
+                    UltraDetailPreset.MAX, UltraDetailPreset.ULTRA -> 0.5f
+                }
+                
+                if (transferReferenceDetail(enhancedBitmap, sharpestFrame, refTransferOutput, refBlendStrength)) {
+                    if (enhancedBitmap !== outputBitmap) enhancedBitmap.recycle()
+                    enhancedBitmap = refTransferOutput
+                    Log.d(TAG, "║   - Reference detail transfer applied (blend=$refBlendStrength)")
+                } else {
+                    refTransferOutput.recycle()
+                    Log.w(TAG, "║   - Reference detail transfer failed, skipping")
+                }
+                
                 // Step 1: Frequency separation with adaptive sharpening
                 Log.i(TAG, "║ Stage 3.5a: Frequency separation...")
                 val freqOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
@@ -945,21 +1244,78 @@ class UltraDetailPipeline(
                 }
                 
                 // Step 4: Texture synthesis for low-detail regions
-                Log.i(TAG, "║ Stage 3.5d: Texture synthesis...")
-                val texOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
-                val texConfig = TextureSynthConfig(
-                    patchSize = 7,
-                    searchRadius = 24,
-                    blendWeight = 0.4f
-                )
+                // Phase 2: Tiled hybrid CPU-GPU processing for 3-5x additional speedup
+                val outputMegapixels = (outputWidth.toLong() * outputHeight.toLong()) / 1_000_000f
+                val useTiled = outputMegapixels > 20f
                 
-                if (synthesizeTexture(enhancedBitmap, texOutput, texConfig)) {
-                    if (enhancedBitmap !== outputBitmap) enhancedBitmap.recycle()
-                    enhancedBitmap = texOutput
-                    Log.d(TAG, "║   - Texture synthesis applied")
+                // Quick quality check: analyze if texture synthesis is beneficial
+                // This prevents wasting 4+ minutes on images that already have good detail
+                val qualityScore = analyzeImageQuality(enhancedBitmap)
+                Log.i(TAG, "║ Stage 3.5d: Image quality score: ${"%.2f".format(qualityScore)} (0=good detail, 1=needs synthesis)")
+                
+                if (qualityScore < 0.3f) {
+                    Log.i(TAG, "║ Stage 3.5d: Skipping texture synthesis - image already has sufficient detail")
                 } else {
-                    texOutput.recycle()
-                    Log.w(TAG, "║   - Texture synthesis failed, skipping")
+                    Log.i(TAG, "║ Stage 3.5d: Texture synthesis (${if (useTiled) "Phase 2 tiled" else "Phase 1"})...")
+                    val texOutput = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+                    
+                    // Initialize progress state for texture synthesis
+                    _state.value = PipelineState.SynthesizingTexture(0, 0, 0, 0)
+                    var lastTexSynthUpdate = 0L
+                    
+                    val success = if (useTiled) {
+                        // Adaptive config based on preset for speed/quality tradeoff
+                        val (tileSize, overlap, threads) = when (preset) {
+                            UltraDetailPreset.FAST -> Triple(384, 48, 2)       // Faster: larger tiles, moderate overlap
+                            UltraDetailPreset.BALANCED -> Triple(448, 72, 3)   // Balanced
+                            UltraDetailPreset.MAX, UltraDetailPreset.ULTRA -> Triple(512, 96, 4)  // Quality: smaller tiles, maximum overlap
+                        }
+                        val tiledConfig = TileSynthConfig(
+                            tileSize = tileSize,
+                            overlap = overlap,
+                            useGPU = true,
+                            numCPUThreads = threads
+                        )
+                        // Use progress callback version for UI feedback
+                        synthesizeTextureTiledWithProgress(enhancedBitmap, texOutput, tiledConfig) { completed, total, cpuTiles, gpuTiles ->
+                            // Update UI immediately for first tile, then throttle to max 20/sec
+                            val now = System.currentTimeMillis()
+                            if (completed == 1 || now - lastTexSynthUpdate >= 50 || completed == total) {
+                                _state.value = PipelineState.SynthesizingTexture(completed, total, cpuTiles, gpuTiles)
+                                lastTexSynthUpdate = now
+                                // Log every 10 tiles or at completion for debugging
+                                if (completed % 10 == 0 || completed == total) {
+                                    Log.d(TAG, "║   - Texture synthesis progress: $completed/$total tiles (${(completed * 100 / total)}%) [CPU: $cpuTiles, GPU: $gpuTiles]")
+                                }
+                            }
+                        }
+                    } else {
+                        // Content-aware texture synthesis parameters
+                        val (patchSize, searchRadius, blendWeight) = when (sceneClassification.primaryType) {
+                            SceneType.FACE -> Triple(5, 24, 0.3f)      // Smaller patches, gentler blending
+                            SceneType.TEXT -> Triple(9, 40, 0.5f)      // Larger patches, stronger detail
+                            SceneType.NATURE -> Triple(7, 32, 0.4f)    // Balanced for organic textures
+                            SceneType.ARCHITECTURE -> Triple(9, 36, 0.45f) // Preserve geometric patterns
+                            SceneType.GENERAL -> Triple(7, 32, 0.4f)   // Default balanced
+                        }
+                        
+                        val texConfig = TextureSynthConfig(
+                            patchSize = patchSize,
+                            searchRadius = searchRadius,
+                            blendWeight = blendWeight
+                        )
+                        Log.d(TAG, "║   - Content-aware params: patch=$patchSize, search=$searchRadius, blend=$blendWeight")
+                        synthesizeTexture(enhancedBitmap, texOutput, texConfig)
+                    }
+                    
+                    if (success) {
+                        if (enhancedBitmap !== outputBitmap) enhancedBitmap.recycle()
+                        enhancedBitmap = texOutput
+                        Log.d(TAG, "║   - Texture synthesis applied (${if (useTiled) "tiled" else "single-pass"})")
+                    } else {
+                        texOutput.recycle()
+                        Log.w(TAG, "║   - Texture synthesis failed, skipping")
+                    }
                 }
                 
             } catch (e: Exception) {
@@ -1004,6 +1360,9 @@ class UltraDetailPipeline(
             Log.i(TAG, "║ Stage 4: Neural refinement completed in ${stage4Time}ms")
         }
         
+        // Cleanup temporary resources
+        fusedBase?.recycle()
+        
         val processingTime = System.currentTimeMillis() - startTime
         _state.value = PipelineState.Complete(finalBitmap, processingTime, frames.size)
         
@@ -1012,7 +1371,8 @@ class UltraDetailPipeline(
         Log.i(TAG, "║ HQ MFSR PIPELINE COMPLETE")
         Log.i(TAG, "║ Total time: ${processingTime}ms")
         Log.i(TAG, "║ Output: ${finalBitmap.width}x${finalBitmap.height} (${"%.2f".format(finalMegapixels)}MP)")
-        Log.i(TAG, "║ Stages: Align=${stage1Time}ms, RS=${stage15Time}ms, Mask=${stage2Time}ms, MFSR=${stage3Time}ms, Enhance=${stage35Time}ms, Refine=${stage4Time}ms")
+        Log.i(TAG, "║ Stages: Align=${stage1Time}ms, RS=${stage15Time}ms, ExposureFusion=${stage17Time}ms, Mask=${stage2Time}ms, MFSR=${stage3Time}ms, Enhance=${stage35Time}ms, Refine=${stage4Time}ms")
+        Log.i(TAG, "║ Scene: ${sceneClassification.primaryType}, Frames: ${workingFrames.size}/${frames.size}")
         Log.i(TAG, "═══════════════════════════════════════════════════════════")
         
         // Calculate actual scale factor (ULTRA = MFSR 2x * ESRGAN 4x = 8x)
@@ -1025,7 +1385,7 @@ class UltraDetailPipeline(
         return UltraDetailResult(
             bitmap = finalBitmap,
             processingTimeMs = processingTime,
-            framesUsed = frames.size,
+            framesUsed = workingFrames.size,
             detailTilesCount = 0,
             srTilesProcessed = (width / 256) * (height / 256),
             preset = preset,
@@ -1178,6 +1538,154 @@ class UltraDetailPipeline(
     }
     
     /**
+     * Select best frames for memory-constrained processing
+     * 
+     * Prioritizes:
+     * 1. Reference frame (always included)
+     * 2. Frames with most sub-pixel diversity (different gyro offsets)
+     * 3. Sharpest frames
+     * 
+     * @param frames All available frames
+     * @param referenceIndex Index of reference frame (must be included)
+     * @param maxFrames Maximum number of frames to return
+     * @return Selected frames including reference
+     */
+    private fun selectBestFramesForMemory(
+        frames: List<HighQualityCapturedFrame>,
+        referenceIndex: Int,
+        maxFrames: Int
+    ): List<HighQualityCapturedFrame> {
+        if (frames.size <= maxFrames) return frames
+        if (maxFrames <= 1) return listOf(frames[referenceIndex])
+        
+        // Score each frame by diversity (gyro offset from reference) and sharpness
+        val refGyro = computeGyroMagnitude(frames[referenceIndex].gyroSamples)
+        
+        val scored = frames.mapIndexed { index, frame ->
+            if (index == referenceIndex) {
+                // Reference always gets highest score
+                Triple(index, frame, Float.MAX_VALUE)
+            } else {
+                val gyro = computeGyroMagnitude(frame.gyroSamples)
+                val gyroDiversity = kotlin.math.abs(gyro - refGyro)  // Different offset = good for MFSR
+                val sharpness = computeBitmapSharpness(frame.bitmap)
+                // Combine: diversity is more important for MFSR quality
+                val score = gyroDiversity * 1000f + sharpness * 0.1f
+                Triple(index, frame, score)
+            }
+        }
+        
+        // Sort by score descending and take top maxFrames
+        val selected = scored
+            .sortedByDescending { it.third }
+            .take(maxFrames)
+            .map { it.second }
+        
+        Log.d(TAG, "Selected ${selected.size} frames for memory-constrained processing")
+        return selected
+    }
+    
+    /**
+     * Lucky Imaging: Select only the sharpest frames from burst
+     * 
+     * Inspired by astronomy technique - discard motion-blurred frames
+     * to improve multi-frame fusion quality.
+     * 
+     * Also applies motion rejection threshold to discard frames with
+     * excessive motion (>2px estimated from gyro).
+     * 
+     * @param frames All captured frames
+     * @param referenceIndex Index of reference frame (always included)
+     * @param preset Quality preset (determines selection ratio)
+     * @return Filtered list of sharpest frames
+     */
+    private fun selectLuckyFrames(
+        frames: List<HighQualityCapturedFrame>,
+        referenceIndex: Int,
+        preset: UltraDetailPreset
+    ): List<HighQualityCapturedFrame> {
+        if (frames.size <= 3) return frames  // Too few frames to filter
+        
+        // Motion rejection thresholds - TIGHTENED to reduce ghosting
+        // Gyro magnitude threshold (radians) - reject frames with excessive rotation
+        val gyroThreshold = when (preset) {
+            UltraDetailPreset.FAST -> 0.03f        // More lenient (~1.7 degrees)
+            UltraDetailPreset.BALANCED -> 0.02f    // Moderate (~1.1 degrees)
+            UltraDetailPreset.MAX, UltraDetailPreset.ULTRA -> 0.01f  // Very strict (~0.6 degrees) - critical for ghosting
+        }
+        
+        // Absolute gyro magnitude threshold - reject frames with very high motion regardless of reference
+        val absoluteGyroThreshold = 0.05f  // ~2.9 degrees - stricter to avoid motion blur
+        
+        // First pass: Reject frames with excessive motion
+        val refGyro = computeGyroMagnitude(frames[referenceIndex].gyroSamples)
+        val motionFiltered = frames.filterIndexed { index, frame ->
+            if (index == referenceIndex) {
+                true  // Always keep reference
+            } else {
+                val gyro = computeGyroMagnitude(frame.gyroSamples)
+                val gyroDiff = kotlin.math.abs(gyro - refGyro)
+                
+                // Reject if: (1) too different from reference, OR (2) absolute motion too high
+                if (gyroDiff > gyroThreshold) {
+                    Log.d(TAG, "Motion rejection: Frame $index rejected (gyroDiff=${"%.4f".format(gyroDiff)} > ${gyroThreshold})")
+                    false
+                } else if (gyro > absoluteGyroThreshold) {
+                    Log.d(TAG, "Motion rejection: Frame $index rejected (absoluteGyro=${"%.4f".format(gyro)} > ${absoluteGyroThreshold})")
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+        
+        val rejectedCount = frames.size - motionFiltered.size
+        if (rejectedCount > 0) {
+            Log.i(TAG, "Motion rejection: Rejected $rejectedCount/${frames.size} frames with excessive motion")
+        }
+        
+        if (motionFiltered.size <= 3) return motionFiltered  // Too few frames after motion rejection
+        
+        // Second pass: Lucky Imaging - select sharpest frames
+        val selectionRatio = when (preset) {
+            UltraDetailPreset.FAST -> 0.7f        // Keep 70% (faster, less strict)
+            UltraDetailPreset.BALANCED -> 0.5f    // Keep 50% (balanced)
+            UltraDetailPreset.MAX, UltraDetailPreset.ULTRA -> 0.4f  // Keep 40% (quality, strict)
+        }
+        
+        val targetCount = (motionFiltered.size * selectionRatio).toInt().coerceAtLeast(3)
+        
+        // Score all frames by sharpness
+        val scored = motionFiltered.mapIndexed { index, frame ->
+            val sharpness = computeBitmapSharpness(frame.bitmap)
+            Triple(index, frame, sharpness)
+        }
+        
+        // Sort by sharpness descending
+        val sortedBySharpness = scored.sortedByDescending { it.third }
+        
+        // Find sharpness threshold (Nth sharpest frame)
+        val threshold = sortedBySharpness[targetCount - 1].third
+        
+        // Select frames above threshold, always include reference
+        val selected = scored.filter { (index, _, sharpness) ->
+            motionFiltered[index] == frames[referenceIndex] || sharpness >= threshold
+        }.map { it.second }
+        
+        // Log statistics
+        val avgSharpness = scored.map { it.third }.average()
+        val selectedAvgSharpness = selected.map { frame ->
+            scored.first { it.second == frame }.third
+        }.average()
+        
+        Log.d(TAG, "Lucky Imaging: avg sharpness before=${"%.1f".format(avgSharpness)}, " +
+                   "after=${"%.1f".format(selectedAvgSharpness)}, " +
+                   "improvement=${"%+.1f%%".format((selectedAvgSharpness - avgSharpness) / avgSharpness * 100)}")
+        
+        return selected.take(targetCount.coerceAtMost(motionFiltered.size))
+    }
+    
+    /**
      * Compute sharpness of a Bitmap using Laplacian variance
      */
     private fun computeBitmapSharpness(bitmap: Bitmap): Float {
@@ -1257,11 +1765,84 @@ class UltraDetailPipeline(
     ): UltraDetailResult? {
         val pipeline = mfsrPipeline ?: return null
         
-        val scaleFactor = 2
-        val outputWidth = width * scaleFactor
-        val outputHeight = height * scaleFactor
+        // Smart memory management based on available RAM
+        // YUV frames are more memory-efficient (~1.5 bytes/pixel vs 4 bytes for ARGB)
+        val memStats = MemoryStats.current()
+        val requestedOutputPixels = width.toLong() * height.toLong() * 4L  // 2x scale = 4x pixels
         
-        Log.i(TAG, "Processing ${frames.size} frames with ULTRA preset: ${width}x${height} -> ${outputWidth}x${outputHeight}")
+        // YUV memory estimate: ~1.5 bytes/pixel per frame
+        val inputMemoryMb = (frames.size * width.toLong() * height.toLong() * 3L / 2L) / (1024 * 1024)
+        val outputMemoryMb = (requestedOutputPixels * 4L) / (1024 * 1024)
+        val nativeBuffersMb = 200L
+        val safetyMarginMb = 200L
+        val totalRequiredMb = inputMemoryMb + outputMemoryMb + nativeBuffersMb + safetyMarginMb
+        
+        Log.i(TAG, "║ Memory analysis (YUV): available=${memStats.availableMemoryMb}MB, " +
+                   "required=${totalRequiredMb}MB (input=${inputMemoryMb}MB, output=${outputMemoryMb}MB)")
+        
+        val scaleFactor: Int
+        val outputWidth: Int
+        val outputHeight: Int
+        var workingFrames = frames
+        
+        when {
+            // Case 1: Enough memory for full resolution
+            memStats.availableMemoryMb >= totalRequiredMb -> {
+                scaleFactor = 2
+                outputWidth = width * scaleFactor
+                outputHeight = height * scaleFactor
+                Log.i(TAG, "║ Memory OK: Full 2x resolution enabled")
+            }
+            
+            // Case 2: Can achieve full resolution by reducing frame count
+            memStats.availableMemoryMb >= (outputMemoryMb + nativeBuffersMb + safetyMarginMb + 50) -> {
+                scaleFactor = 2
+                outputWidth = width * scaleFactor
+                outputHeight = height * scaleFactor
+                
+                // Calculate how many frames we can afford (YUV is ~1.5 bytes/pixel)
+                val availableForFrames = memStats.availableMemoryMb - outputMemoryMb - nativeBuffersMb - safetyMarginMb
+                val frameMemoryMb = (width.toLong() * height.toLong() * 3L / 2L) / (1024 * 1024)
+                val maxFrames = maxOf(3, (availableForFrames / maxOf(1, frameMemoryMb)).toInt())
+                
+                if (maxFrames < frames.size) {
+                    workingFrames = selectBestYUVFramesForMemory(frames, maxFrames)
+                    Log.w(TAG, "║ Memory optimization: Reduced frames from ${frames.size} to ${workingFrames.size} for full 2x output")
+                }
+            }
+            
+            // Case 3: Must reduce output resolution
+            else -> {
+                val availableForOutput = memStats.availableMemoryMb - nativeBuffersMb - safetyMarginMb - 50
+                val maxOutputPixels = (availableForOutput * 1024 * 1024) / 4
+                
+                if (maxOutputPixels >= width.toLong() * height.toLong()) {
+                    val safeScale = kotlin.math.sqrt(maxOutputPixels.toDouble() / (width.toLong() * height.toLong())).toFloat()
+                    if (safeScale >= 1.4f) {
+                        scaleFactor = 2
+                        val downscaleRatio = kotlin.math.sqrt(maxOutputPixels.toDouble() / requestedOutputPixels).toFloat()
+                        outputWidth = ((width * 2) * downscaleRatio).toInt()
+                        outputHeight = ((height * 2) * downscaleRatio).toInt()
+                        workingFrames = selectBestYUVFramesForMemory(frames, 4)
+                        Log.w(TAG, "║ Memory limit: Output ${outputWidth}x${outputHeight}, ${workingFrames.size} frames")
+                    } else {
+                        scaleFactor = 1
+                        outputWidth = width
+                        outputHeight = height
+                        workingFrames = selectBestYUVFramesForMemory(frames, 4)
+                        Log.w(TAG, "║ Memory limit: 1x scale with ${workingFrames.size} frames")
+                    }
+                } else {
+                    scaleFactor = 1
+                    outputWidth = width
+                    outputHeight = height
+                    workingFrames = frames.take(1)
+                    Log.e(TAG, "║ Critical memory: Single frame only")
+                }
+            }
+        }
+        
+        Log.i(TAG, "Processing ${workingFrames.size} frames with ULTRA preset: ${width}x${height} -> ${outputWidth}x${outputHeight}")
         
         // Analyze frame diversity for MFSR effectiveness
         val frameDiversity = analyzeFrameDiversity(frames)
@@ -1279,7 +1860,7 @@ class UltraDetailPipeline(
             ProcessingStage.ALIGNING_FRAMES, 0f, "Computing gyro alignment..."
         )
         
-        val homographies = gyroHelper.computeAllHomographies(frames)
+        val homographies = gyroHelper.computeAllHomographies(workingFrames)
         
         // Stage 2: Process through MFSR pipeline (direct YUV - saves ~360MB RAM)
         _state.value = PipelineState.ProcessingMFSR(0, 0, 0f)
@@ -1288,7 +1869,7 @@ class UltraDetailPipeline(
         
         // Use -1 for referenceIndex to auto-select the most stable frame
         val mfsrResult = pipeline.processYUV(
-            frames = frames,
+            frames = workingFrames,
             referenceIndex = -1,  // Auto-select: lowest gyro rotation
             homographies = homographies,
             outputBitmap = outputBitmap,
@@ -1306,7 +1887,7 @@ class UltraDetailPipeline(
             return UltraDetailResult(
                 bitmap = outputBitmap,
                 processingTimeMs = System.currentTimeMillis() - startTime,
-                framesUsed = frames.size,
+                framesUsed = workingFrames.size,
                 detailTilesCount = 0,
                 srTilesProcessed = 0,
                 preset = UltraDetailPreset.ULTRA,
@@ -1352,14 +1933,14 @@ class UltraDetailPipeline(
         }
         
         val processingTime = System.currentTimeMillis() - startTime
-        _state.value = PipelineState.Complete(rotatedBitmap, processingTime, frames.size)
+        _state.value = PipelineState.Complete(rotatedBitmap, processingTime, workingFrames.size)
         
         Log.i(TAG, "ULTRA pipeline complete: ${processingTime}ms, ${rotatedBitmap.width}x${rotatedBitmap.height}")
         
         return UltraDetailResult(
             bitmap = rotatedBitmap,
             processingTimeMs = processingTime,
-            framesUsed = frames.size,
+            framesUsed = workingFrames.size,
             detailTilesCount = 0,
             srTilesProcessed = (width / 256) * (height / 256),
             preset = UltraDetailPreset.ULTRA,
@@ -1370,13 +1951,98 @@ class UltraDetailPipeline(
     }
     
     /**
-     * Generate a quick preview bitmap from the reference frame.
+     * Select best YUV frames for memory-constrained processing
+     * Prioritizes frames with diverse gyro offsets for better MFSR quality
+     */
+    private fun selectBestYUVFramesForMemory(
+        frames: List<CapturedFrame>,
+        maxFrames: Int
+    ): List<CapturedFrame> {
+        if (frames.size <= maxFrames) return frames
+        if (maxFrames <= 1) return frames.take(1)
+        
+        // Score by gyro diversity - select frames with varied offsets
+        val scored = frames.mapIndexed { index, frame ->
+            val gyroMag = computeGyroMagnitude(frame.gyroSamples)
+            Pair(frame, gyroMag)
+        }
+        
+        // Sort by gyro magnitude and select evenly distributed frames
+        val sorted = scored.sortedBy { it.second }
+        val step = sorted.size.toFloat() / maxFrames
+        val selected = (0 until maxFrames).map { i ->
+            sorted[minOf((i * step).toInt(), sorted.lastIndex)].first
+        }
+        
+        Log.d(TAG, "Selected ${selected.size} YUV frames for memory-constrained processing")
+        return selected
+    }
+    
+    /**
+     * Generate a quick preview bitmap from high-quality captured frames.
      * Shows the user what was captured immediately, before full processing.
      * 
-     * @param frames List of captured frames
+     * @param frames List of high-quality captured frames (Bitmap-based)
      * @return Preview bitmap (center crop of best frame), or null on failure
      */
-    suspend fun generateQuickPreview(frames: List<CapturedFrame>): Bitmap? = withContext(Dispatchers.Default) {
+    suspend fun generateQuickPreview(frames: List<HighQualityCapturedFrame>): Bitmap? = withContext(Dispatchers.Default) {
+        if (frames.isEmpty()) return@withContext null
+        
+        try {
+            // Select the most stable frame (lowest gyro rotation)
+            val bestFrameIndex = selectBestHQFrame(frames)
+            val bestFrame = frames[bestFrameIndex]
+            
+            // Create a smaller preview (center crop, 1/4 size)
+            val previewWidth = bestFrame.width / 2
+            val previewHeight = bestFrame.height / 2
+            val offsetX = bestFrame.width / 4
+            val offsetY = bestFrame.height / 4
+            
+            // Crop from the bitmap
+            val preview = Bitmap.createBitmap(
+                bestFrame.bitmap,
+                offsetX, offsetY,
+                previewWidth, previewHeight
+            )
+            
+            Log.d(TAG, "Generated quick preview from HQ frame $bestFrameIndex: ${preview.width}x${preview.height}")
+            preview
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to generate HQ preview", e)
+            null
+        }
+    }
+    
+    /**
+     * Select the best high-quality frame based on gyro stability
+     */
+    private fun selectBestHQFrame(frames: List<HighQualityCapturedFrame>): Int {
+        if (frames.size <= 1) return 0
+        
+        var bestIndex = 0
+        var lowestGyro = Float.MAX_VALUE
+        
+        frames.forEachIndexed { index, frame ->
+            val gyroMag = computeGyroMagnitude(frame.gyroSamples)
+            if (gyroMag < lowestGyro) {
+                lowestGyro = gyroMag
+                bestIndex = index
+            }
+        }
+        
+        return bestIndex
+    }
+    
+    /**
+     * Generate a quick preview bitmap from the reference frame (YUV frames).
+     * Shows the user what was captured immediately, before full processing.
+     * 
+     * @param frames List of captured YUV frames
+     * @return Preview bitmap (center crop of best frame), or null on failure
+     */
+    suspend fun generateQuickPreviewYUV(frames: List<CapturedFrame>): Bitmap? = withContext(Dispatchers.Default) {
         if (frames.isEmpty()) return@withContext null
         
         try {
@@ -1681,6 +2347,71 @@ class UltraDetailPipeline(
         _state.value = PipelineState.Idle
     }
     
+    // ==================== Device Capability & Thermal Management ====================
+    
+    /**
+     * Get current device capability
+     */
+    fun getDeviceCapability(): DeviceCapability = deviceCapability
+    
+    /**
+     * Get current quality tier
+     */
+    fun getCurrentQualityTier(): QualityTier = currentQualityTier
+    
+    /**
+     * Get quality tier configuration adjusted for device
+     */
+    fun getQualityTierConfig(tier: QualityTier): QualityTierConfig {
+        return deviceCapability.getQualityTierConfig(tier)
+    }
+    
+    /**
+     * Check thermal status and wait if necessary
+     * Call this periodically during long processing operations
+     * 
+     * @return true if processing should continue, false if aborted
+     */
+    suspend fun checkThermalStatus(): Boolean {
+        val status = deviceCapabilityManager.getThermalStatus()
+        _thermalState.value = status
+        
+        if (status.shouldAbort) {
+            Log.e(TAG, "Thermal abort: ${status.message}")
+            return false
+        }
+        
+        if (status.shouldPause) {
+            Log.w(TAG, "Thermal pause: ${status.message}")
+            return deviceCapabilityManager.checkThermalAndWait()
+        }
+        
+        return true
+    }
+    
+    /**
+     * Get recommended frame count based on device capability and quality tier
+     */
+    fun getRecommendedFrameCount(): Int {
+        val tierConfig = deviceCapability.getQualityTierConfig(currentQualityTier)
+        return tierConfig.frameCount
+    }
+    
+    /**
+     * Get estimated processing time in seconds
+     */
+    fun getEstimatedProcessingTime(): Int {
+        val tierConfig = deviceCapability.getQualityTierConfig(currentQualityTier)
+        return tierConfig.estimatedTimeSeconds
+    }
+    
+    /**
+     * Set thermal callback for UI updates
+     */
+    fun setThermalCallback(callback: ThermalCallback?) {
+        deviceCapabilityManager.setThermalCallback(callback)
+    }
+    
     override fun close() {
         cancel()
         nativeProcessor?.close()
@@ -1691,6 +2422,74 @@ class UltraDetailPipeline(
         srProcessor = null
         mfsrPipeline = null
         mfsrRefiner = null
+    }
+    
+    /**
+     * Analyze image quality to determine if texture synthesis is beneficial
+     * Returns a score from 0.0 (image has good detail) to 1.0 (needs synthesis)
+     */
+    private fun analyzeImageQuality(bitmap: Bitmap): Float {
+        val width = bitmap.width
+        val height = bitmap.height
+        val sampleStep = 32  // Sample every 32 pixels
+        val varianceRadius = 3
+        
+        var totalVariance = 0f
+        var lowDetailPixels = 0
+        var sampleCount = 0
+        
+        for (y in varianceRadius until height - varianceRadius step sampleStep) {
+            for (x in varianceRadius until width - varianceRadius step sampleStep) {
+                // Compute local variance
+                var sumR = 0f
+                var sumG = 0f
+                var sumB = 0f
+                var sumR2 = 0f
+                var sumG2 = 0f
+                var sumB2 = 0f
+                var count = 0
+                
+                for (dy in -varianceRadius..varianceRadius) {
+                    for (dx in -varianceRadius..varianceRadius) {
+                        val pixel = bitmap.getPixel(x + dx, y + dy)
+                        val r = ((pixel shr 16) and 0xFF) / 255f
+                        val g = ((pixel shr 8) and 0xFF) / 255f
+                        val b = (pixel and 0xFF) / 255f
+                        
+                        sumR += r
+                        sumG += g
+                        sumB += b
+                        sumR2 += r * r
+                        sumG2 += g * g
+                        sumB2 += b * b
+                        count++
+                    }
+                }
+                
+                val meanR = sumR / count
+                val meanG = sumG / count
+                val meanB = sumB / count
+                val varR = (sumR2 / count) - (meanR * meanR)
+                val varG = (sumG2 / count) - (meanG * meanG)
+                val varB = (sumB2 / count) - (meanB * meanB)
+                val variance = (varR + varG + varB) / 3f
+                
+                totalVariance += variance
+                if (variance < 0.005f) {  // Low detail threshold
+                    lowDetailPixels++
+                }
+                sampleCount++
+            }
+        }
+        
+        if (sampleCount == 0) return 0f
+        
+        val avgVariance = totalVariance / sampleCount
+        val lowDetailRatio = lowDetailPixels.toFloat() / sampleCount
+        
+        // Score: 0.0 = image already has good detail, 1.0 = needs synthesis
+        // If >40% of samples have low variance, synthesis is beneficial
+        return (lowDetailRatio * 2.5f).coerceAtMost(1.0f)
     }
     
     /**

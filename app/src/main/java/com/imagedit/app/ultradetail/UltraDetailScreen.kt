@@ -46,6 +46,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.compose.foundation.Image
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.Color
 import kotlinx.coroutines.launch
 
 /**
@@ -250,13 +252,25 @@ fun UltraDetailScreen(
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
-                // Camera preview
-                AndroidView(
-                    factory = { ctx ->
-                        PreviewView(ctx).also { previewView = it }
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
+                // Show preview bitmap during processing (saves CPU/GPU by not running camera)
+                // Otherwise show live camera preview
+                if (uiState.isProcessing && uiState.previewBitmap != null) {
+                    // Show captured frame as background during processing
+                    Image(
+                        bitmap = uiState.previewBitmap!!.asImageBitmap(),
+                        contentDescription = "Captured frame",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                } else {
+                    // Camera preview
+                    AndroidView(
+                        factory = { ctx ->
+                            PreviewView(ctx).also { previewView = it }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
                 
                 // ULTRA mode settings panel (refinement strength)
                 AnimatedVisibility(
@@ -270,7 +284,10 @@ fun UltraDetailScreen(
                 ) {
                     UltraSettingsPanel(
                         refinementStrength = uiState.refinementStrength,
-                        onRefinementStrengthChange = { viewModel.setRefinementStrength(it) }
+                        onRefinementStrengthChange = { viewModel.setRefinementStrength(it) },
+                        rawSupported = uiState.isRawCaptureSupported,
+                        rawEnabled = uiState.rawCaptureEnabled,
+                        onRawEnabledChange = { viewModel.setRawCaptureEnabled(it) }
                     )
                 }
                 
@@ -287,7 +304,10 @@ fun UltraDetailScreen(
                     DenoiseSettingsPanel(
                         denoiseStrength = uiState.denoiseStrength,
                         onDenoiseStrengthChange = { viewModel.setDenoiseStrength(it) },
-                        preset = uiState.selectedPreset
+                        preset = uiState.selectedPreset,
+                        rawSupported = uiState.isRawCaptureSupported,
+                        rawEnabled = uiState.rawCaptureEnabled,
+                        onRawEnabledChange = { viewModel.setRawCaptureEnabled(it) }
                     )
                 }
                 
@@ -304,6 +324,9 @@ fun UltraDetailScreen(
                     totalTiles = uiState.totalTiles,
                     statusMessage = uiState.statusMessage,
                     preset = uiState.selectedPreset,
+                    thermalState = uiState.thermalState,
+                    thermalTemperature = uiState.thermalTemperature,
+                    isPausedForThermal = uiState.isPausedForThermal,
                     onCaptureClick = {
                         burstController?.let { controller ->
                             viewModel.startCapture(controller)
@@ -542,6 +565,9 @@ private fun CaptureControls(
     totalTiles: Int,
     statusMessage: String,
     preset: UltraDetailPreset,
+    thermalState: ThermalState = ThermalState.NORMAL,
+    thermalTemperature: Float = 30f,
+    isPausedForThermal: Boolean = false,
     onCaptureClick: () -> Unit,
     onCancelClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -599,13 +625,17 @@ private fun CaptureControls(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.padding(20.dp)
                 ) {
-                    // Stage indicator
+                    // Stage indicator with user-friendly labels
                     Text(
                         text = when (processingStage) {
-                            UiProcessingStage.CAPTURING -> "📷 Capturing..."
+                            UiProcessingStage.CAPTURING -> "📷 Capturing frames..."
+                            UiProcessingStage.SELECTING_FRAMES -> "🎯 Selecting sharpest frames..."
+                            UiProcessingStage.CLASSIFYING_SCENE -> "🔍 Analyzing scene content..."
                             UiProcessingStage.ALIGNING -> "🔄 Aligning frames..."
+                            UiProcessingStage.EXPOSURE_FUSION -> "🌅 Fusing exposures for HDR..."
                             UiProcessingStage.SUPER_RESOLUTION -> "✨ Enhancing resolution..."
-                            UiProcessingStage.REFINING -> "🎨 Refining details..."
+                            UiProcessingStage.DETAIL_TRANSFER -> "🎨 Transferring fine details..."
+                            UiProcessingStage.REFINING -> "💎 Refining with AI..."
                             UiProcessingStage.FINALIZING -> "✅ Finalizing..."
                             else -> "⏳ Processing..."
                         },
@@ -679,6 +709,52 @@ private fun CaptureControls(
                         )
                     }
                     
+                    // Thermal warning display
+                    if (thermalState != ThermalState.NORMAL) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(
+                                    color = when (thermalState) {
+                                        ThermalState.WARM -> Color(0xFFFFF3E0)  // Light orange
+                                        ThermalState.HOT -> Color(0xFFFFEBEE)   // Light red
+                                        ThermalState.CRITICAL -> Color(0xFFFFCDD2)  // Red
+                                        else -> Color.Transparent
+                                    },
+                                    shape = RoundedCornerShape(4.dp)
+                                )
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = when (thermalState) {
+                                    ThermalState.WARM -> "🌡️"
+                                    ThermalState.HOT -> "🔥"
+                                    ThermalState.CRITICAL -> "⚠️"
+                                    else -> ""
+                                },
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isPausedForThermal) {
+                                    "Cooling down... (${thermalTemperature.toInt()}°C)"
+                                } else {
+                                    "Device warm (${thermalTemperature.toInt()}°C)"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = when (thermalState) {
+                                    ThermalState.WARM -> Color(0xFFE65100)
+                                    ThermalState.HOT -> Color(0xFFC62828)
+                                    ThermalState.CRITICAL -> Color(0xFFB71C1C)
+                                    else -> MaterialTheme.colorScheme.onSurface
+                                }
+                            )
+                        }
+                    }
+                    
                     Spacer(modifier = Modifier.height(8.dp))
                     
                     // Encouraging message
@@ -725,12 +801,21 @@ private fun CaptureControls(
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
                     ),
-                    modifier = Modifier.padding(bottom = 8.dp)
+                    modifier = Modifier
+                        .padding(bottom = 8.dp)
+                        .fillMaxWidth(0.95f)
                 ) {
                     Text(
-                        text = if (isCapturing) "Capturing frames..." else statusMessage,
+                        text = statusMessage,
                         color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 2,
+                        softWrap = true,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
                     )
                 }
                 
@@ -1027,6 +1112,9 @@ private fun DenoiseSettingsPanel(
     denoiseStrength: Float,
     onDenoiseStrengthChange: (Float) -> Unit,
     preset: UltraDetailPreset,
+    rawSupported: Boolean,
+    rawEnabled: Boolean,
+    onRawEnabledChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -1105,6 +1193,31 @@ private fun DenoiseSettingsPanel(
                 color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
                 modifier = Modifier.padding(top = 8.dp)
             )
+
+            if (preset == UltraDetailPreset.MAX && rawSupported) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "RAW Capture",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Save DNG burst + use RAW for best quality",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = rawEnabled,
+                        onCheckedChange = onRawEnabledChange
+                    )
+                }
+            }
         }
     }
 }
@@ -1116,6 +1229,9 @@ private fun DenoiseSettingsPanel(
 private fun UltraSettingsPanel(
     refinementStrength: Float,
     onRefinementStrengthChange: (Float) -> Unit,
+    rawSupported: Boolean,
+    rawEnabled: Boolean,
+    onRawEnabledChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -1194,6 +1310,31 @@ private fun UltraSettingsPanel(
                 color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
                 modifier = Modifier.padding(top = 8.dp)
             )
+
+            if (rawSupported) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "RAW Capture",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Save DNG burst + use RAW for best quality",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = rawEnabled,
+                        onCheckedChange = onRawEnabledChange
+                    )
+                }
+            }
         }
     }
 }
