@@ -1,0 +1,6 @@
+SHA256 hash of realesrgan_x4plus_fp32.onnx:
+1fd84e5135d0fc20acdecb1e6ad76209cd6d738599b3e253792aa74dc005436c
+CertUtil: -hashfile command completed successfully.
+SHA256 hash of realesrgan_x4plus_anime_fp32.onnx:
+6f1023b8eb9f10bc7ebf16e0f865992e9d4108393051a01ab790c62f6575971e
+CertUtil: -hashfile command completed successfully.

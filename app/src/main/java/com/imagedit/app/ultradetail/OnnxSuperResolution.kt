@@ -42,15 +42,15 @@ enum class OnnxSRModel(
     val recommendedTileSize: Int
 ) {
     REAL_ESRGAN_X4(
-        "realesrgan_x4plus_fp16.onnx",
+        "realesrgan_x4plus_fp32.onnx",
         4,
-        "Real-ESRGAN x4plus (general photos)",
+        "Real-ESRGAN x4plus (best quality)",
         256
     ),
     REAL_ESRGAN_X4_ANIME(
-        "realesrgan_x4plus_anime_fp16.onnx",
+        "realesrgan_x4plus_anime_fp32.onnx",
         4,
-        "Real-ESRGAN x4plus anime (sharper)",
+        "Real-ESRGAN x4plus anime",
         256
     ),
     SWINIR_X4(

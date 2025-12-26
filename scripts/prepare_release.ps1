@@ -22,10 +22,10 @@ Set-Location $ScriptDir
 
 # Check Python dependencies
 Write-Host "Checking Python dependencies..." -ForegroundColor Yellow
-try {
-    python -c "import torch" 2>$null
+$pythonCheck = python -c "import torch" 2>&1
+if ($LASTEXITCODE -eq 0) {
     Write-Host "✓ Python dependencies OK" -ForegroundColor Green
-} catch {
+} else {
     Write-Host "Installing Python dependencies..." -ForegroundColor Yellow
     pip install -r requirements.txt
 }

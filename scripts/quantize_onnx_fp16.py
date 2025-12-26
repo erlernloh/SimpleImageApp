@@ -17,16 +17,49 @@ import argparse
 def quantize_to_fp16(input_path: str, output_path: str):
     """Convert ONNX model from FP32 to FP16."""
     import onnx
-    from onnxmltools.utils.float16_converter import convert_float_to_float16
+    from onnx import numpy_helper
+    import numpy as np
     
     print(f"Loading model: {input_path}")
     model = onnx.load(input_path)
     
     print("Converting to FP16...")
-    model_fp16 = convert_float_to_float16(model)
+    
+    # Convert all float32 tensors to float16
+    for tensor in model.graph.initializer:
+        if tensor.data_type == onnx.TensorProto.FLOAT:
+            # Convert float32 to float16
+            float32_data = numpy_helper.to_array(tensor)
+            float16_data = float32_data.astype(np.float16)
+            
+            # Update tensor
+            tensor.ClearField('float_data')
+            tensor.ClearField('raw_data')
+            tensor.data_type = onnx.TensorProto.FLOAT16
+            tensor.raw_data = float16_data.tobytes()
+    
+    # Update graph inputs/outputs to float16
+    for input_tensor in model.graph.input:
+        if input_tensor.type.tensor_type.elem_type == onnx.TensorProto.FLOAT:
+            input_tensor.type.tensor_type.elem_type = onnx.TensorProto.FLOAT16
+    
+    for output_tensor in model.graph.output:
+        if output_tensor.type.tensor_type.elem_type == onnx.TensorProto.FLOAT:
+            output_tensor.type.tensor_type.elem_type = onnx.TensorProto.FLOAT16
+    
+    # Update nodes to use float16
+    for node in model.graph.node:
+        for attr in node.attribute:
+            if attr.HasField('t') and attr.t.data_type == onnx.TensorProto.FLOAT:
+                float32_data = numpy_helper.to_array(attr.t)
+                float16_data = float32_data.astype(np.float16)
+                attr.t.ClearField('float_data')
+                attr.t.ClearField('raw_data')
+                attr.t.data_type = onnx.TensorProto.FLOAT16
+                attr.t.raw_data = float16_data.tobytes()
     
     print(f"Saving to: {output_path}")
-    onnx.save(model_fp16, output_path)
+    onnx.save(model, output_path)
     
     # Report sizes
     original_size = os.path.getsize(input_path) / (1024 * 1024)
