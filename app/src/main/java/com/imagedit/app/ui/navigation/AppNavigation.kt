@@ -60,6 +60,9 @@ fun AppNavigation(
                     },
                     onNavigateToUltraDetail = {
                         navController.navigate("ultra_detail")
+                    },
+                    onNavigateToSettings = {
+                        navController.navigate("settings")
                     }
                 )
             }

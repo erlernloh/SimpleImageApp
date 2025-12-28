@@ -55,6 +55,7 @@ fun CameraScreen(
     onPhotoTaken: (String) -> Unit,
     onBatchEdit: (List<String>) -> Unit = {},
     onNavigateToUltraDetail: () -> Unit = {},
+    onNavigateToSettings: () -> Unit = {},
     viewModel: CameraViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
@@ -425,6 +426,10 @@ fun CameraScreen(
                             viewModel.changeResolution(resolution, lifecycleOwner, provider)
                         }
                         showSettingsDialog = false
+                    },
+                    onNavigateToAppSettings = {
+                        showSettingsDialog = false
+                        onNavigateToSettings()
                     }
                 )
             }
@@ -547,7 +552,8 @@ private fun CameraControls(
 private fun CameraSettingsDialog(
     settings: CameraSettings,
     onDismiss: () -> Unit,
-    onResolutionChange: (Resolution) -> Unit
+    onResolutionChange: (Resolution) -> Unit,
+    onNavigateToAppSettings: () -> Unit = {}
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -594,8 +600,14 @@ private fun CameraSettingsDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Close")
+            Row {
+                TextButton(onClick = onNavigateToAppSettings) {
+                    Text("App Settings")
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                TextButton(onClick = onDismiss) {
+                    Text("Close")
+                }
             }
         }
     )
