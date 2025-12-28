@@ -23,6 +23,7 @@ import com.imagedit.app.domain.model.*
 @Composable
 fun SettingsScreen(
     onNavigateBack: () -> Unit,
+    onNavigateToModelManagement: () -> Unit = {},
     viewModel: SettingsViewModel = hiltViewModel()
 ) {
     val settings by viewModel.settings.collectAsState()
@@ -48,6 +49,13 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp)
         ) {
+            // AI Models Section
+            AIModelsSection(
+                onNavigateToModelManagement = onNavigateToModelManagement
+            )
+            
+            Divider()
+            
             // Performance Mode Section
             PerformanceModeSection(
                 currentMode = settings.processingMode,
@@ -290,6 +298,34 @@ private fun SettingItem(
             checked = checked,
             onCheckedChange = onCheckedChange
         )
+    }
+}
+
+@Composable
+private fun AIModelsSection(
+    onNavigateToModelManagement: () -> Unit
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Text(
+            text = "AI Models",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold
+        )
+        
+        Text(
+            text = "Manage downloadable AI models for enhanced image processing.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        
+        OutlinedButton(
+            onClick = onNavigateToModelManagement,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Manage AI Models")
+        }
     }
 }
 

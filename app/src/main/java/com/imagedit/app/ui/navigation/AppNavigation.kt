@@ -21,6 +21,7 @@ import com.imagedit.app.ui.editor.PhotoEditorScreen
 import com.imagedit.app.ui.editor.BatchEditorScreen
 import com.imagedit.app.ui.viewer.PhotoViewerScreen
 import com.imagedit.app.ui.settings.SettingsScreen
+import com.imagedit.app.ui.settings.ModelManagementScreen
 import com.imagedit.app.ultradetail.UltraDetailScreen
 import java.net.URLEncoder
 import java.net.URLDecoder
@@ -139,6 +140,17 @@ fun AppNavigation(
         
         composable("settings") {
             SettingsScreen(
+                onNavigateBack = {
+                    navController.popBackStack()
+                },
+                onNavigateToModelManagement = {
+                    navController.navigate("model_management")
+                }
+            )
+        }
+        
+        composable("model_management") {
+            ModelManagementScreen(
                 onNavigateBack = {
                     navController.popBackStack()
                 }
