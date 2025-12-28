@@ -8,6 +8,8 @@ import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
@@ -555,12 +557,43 @@ private fun CameraSettingsDialog(
     onResolutionChange: (Resolution) -> Unit,
     onNavigateToAppSettings: () -> Unit = {}
 ) {
+    val context = LocalContext.current
+    val scrollState = rememberScrollState()
+    
+    // Model download state
+    var modelDownloader by remember { mutableStateOf<com.imagedit.app.ultradetail.ModelDownloader?>(null) }
+    var modelStates by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    var downloadingModel by remember { mutableStateOf<String?>(null) }
+    var downloadProgress by remember { mutableStateOf(0f) }
+    val coroutineScope = rememberCoroutineScope()
+    
+    // Initialize model downloader
+    LaunchedEffect(Unit) {
+        modelDownloader = com.imagedit.app.ultradetail.ModelDownloader(context)
+        // Check which models are downloaded
+        val downloader = modelDownloader ?: return@LaunchedEffect
+        modelStates = mapOf(
+            "realesrgan" to downloader.isModelAvailable(com.imagedit.app.ultradetail.AvailableModels.REAL_ESRGAN_X4_FP32),
+            "realesrgan_anime" to downloader.isModelAvailable(com.imagedit.app.ultradetail.AvailableModels.REAL_ESRGAN_X4_ANIME_FP32)
+        )
+    }
+    
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Camera Settings") },
+        title = { Text("Settings") },
         text = {
-            Column {
-                Text("Photo Resolution", style = MaterialTheme.typography.titleMedium)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 400.dp)
+                    .verticalScroll(scrollState)
+            ) {
+                // ===== PHOTO RESOLUTION SECTION =====
+                Text(
+                    "Photo Resolution",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                )
                 Spacer(modifier = Modifier.height(8.dp))
                 settings.availableResolutions.forEachIndexed { index, resolution ->
                     val isMax = index == 0
@@ -578,13 +611,13 @@ private fun CameraSettingsDialog(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable { onResolutionChange(resolution) }
-                            .padding(vertical = 8.dp)
+                            .padding(vertical = 4.dp)
                     ) {
                         RadioButton(
                             selected = settings.selectedResolution == resolution,
                             onClick = { onResolutionChange(resolution) }
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = buildString {
                                 append("${resolution.width}x${resolution.height}")
@@ -593,22 +626,153 @@ private fun CameraSettingsDialog(
                                 append(" — ")
                                 append(ratioLabel)
                                 if (isMax) append(" (Max)")
-                            }
+                            },
+                            style = MaterialTheme.typography.bodySmall
                         )
                     }
                 }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                Divider()
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // ===== AI MODELS SECTION =====
+                Text(
+                    "AI Models",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                )
+                Text(
+                    "Download models for enhanced upscaling",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                // Real-ESRGAN x4plus
+                ModelDownloadRow(
+                    name = "Real-ESRGAN x4plus",
+                    size = "2 MB",
+                    isDownloaded = modelStates["realesrgan"] == true,
+                    isDownloading = downloadingModel == "realesrgan",
+                    progress = if (downloadingModel == "realesrgan") downloadProgress else 0f,
+                    onDownload = {
+                        coroutineScope.launch {
+                            downloadingModel = "realesrgan"
+                            modelDownloader?.downloadModel(
+                                com.imagedit.app.ultradetail.AvailableModels.REAL_ESRGAN_X4_FP32
+                            )?.collect { state ->
+                                when (state) {
+                                    is com.imagedit.app.ultradetail.DownloadState.Downloading -> {
+                                        downloadProgress = state.progress
+                                    }
+                                    is com.imagedit.app.ultradetail.DownloadState.Complete -> {
+                                        modelStates = modelStates + ("realesrgan" to true)
+                                        downloadingModel = null
+                                    }
+                                    is com.imagedit.app.ultradetail.DownloadState.Error -> {
+                                        downloadingModel = null
+                                    }
+                                    else -> {}
+                                }
+                            }
+                        }
+                    },
+                    onDelete = {
+                        modelDownloader?.deleteModel(com.imagedit.app.ultradetail.AvailableModels.REAL_ESRGAN_X4_FP32)
+                        modelStates = modelStates + ("realesrgan" to false)
+                    }
+                )
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                // Real-ESRGAN Anime
+                ModelDownloadRow(
+                    name = "Real-ESRGAN Anime",
+                    size = "0.5 MB",
+                    isDownloaded = modelStates["realesrgan_anime"] == true,
+                    isDownloading = downloadingModel == "realesrgan_anime",
+                    progress = if (downloadingModel == "realesrgan_anime") downloadProgress else 0f,
+                    onDownload = {
+                        coroutineScope.launch {
+                            downloadingModel = "realesrgan_anime"
+                            modelDownloader?.downloadModel(
+                                com.imagedit.app.ultradetail.AvailableModels.REAL_ESRGAN_X4_ANIME_FP32
+                            )?.collect { state ->
+                                when (state) {
+                                    is com.imagedit.app.ultradetail.DownloadState.Downloading -> {
+                                        downloadProgress = state.progress
+                                    }
+                                    is com.imagedit.app.ultradetail.DownloadState.Complete -> {
+                                        modelStates = modelStates + ("realesrgan_anime" to true)
+                                        downloadingModel = null
+                                    }
+                                    is com.imagedit.app.ultradetail.DownloadState.Error -> {
+                                        downloadingModel = null
+                                    }
+                                    else -> {}
+                                }
+                            }
+                        }
+                    },
+                    onDelete = {
+                        modelDownloader?.deleteModel(com.imagedit.app.ultradetail.AvailableModels.REAL_ESRGAN_X4_ANIME_FP32)
+                        modelStates = modelStates + ("realesrgan_anime" to false)
+                    }
+                )
             }
         },
         confirmButton = {
-            Row {
-                TextButton(onClick = onNavigateToAppSettings) {
-                    Text("App Settings")
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                TextButton(onClick = onDismiss) {
-                    Text("Close")
-                }
+            TextButton(onClick = onDismiss) {
+                Text("Close")
             }
         }
     )
+}
+
+@Composable
+private fun ModelDownloadRow(
+    name: String,
+    size: String,
+    isDownloaded: Boolean,
+    isDownloading: Boolean,
+    progress: Float,
+    onDownload: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(name, style = MaterialTheme.typography.bodyMedium)
+            if (isDownloading) {
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp)
+                )
+            } else {
+                Text(
+                    if (isDownloaded) "Downloaded" else size,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isDownloaded) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        
+        if (!isDownloading) {
+            if (isDownloaded) {
+                TextButton(onClick = onDelete) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            } else {
+                TextButton(onClick = onDownload) {
+                    Text("Download")
+                }
+            }
+        }
+    }
 }

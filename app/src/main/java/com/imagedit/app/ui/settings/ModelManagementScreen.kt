@@ -59,10 +59,7 @@ class ModelManagementViewModel : ViewModel() {
         
         val allModels = listOf(
             AvailableModels.REAL_ESRGAN_X4_FP32,
-            AvailableModels.REAL_ESRGAN_X4_ANIME_FP32,
-            AvailableModels.SWINIR_X4_FP16,
-            AvailableModels.ESRGAN_FP16,
-            AvailableModels.ESRGAN_INT8
+            AvailableModels.REAL_ESRGAN_X4_ANIME_FP32
         )
         
         val modelStates = allModels.map { model ->
