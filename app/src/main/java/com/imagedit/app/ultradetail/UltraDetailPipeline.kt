@@ -172,7 +172,7 @@ class UltraDetailPipeline(
                     
                     // Check if model is downloaded
                     val modelDownloader = ModelDownloader(context)
-                    val modelPath = modelDownloader.getModelPath(AvailableModels.REAL_ESRGAN_X4_FP16)
+                    val modelPath = modelDownloader.getModelPath(AvailableModels.REAL_ESRGAN_X4_FP32)
                     
                     if (modelPath != null) {
                         // Model is downloaded, use it

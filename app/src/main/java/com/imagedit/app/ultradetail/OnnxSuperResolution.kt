@@ -139,10 +139,10 @@ class OnnxSuperResolution(
             
             Log.i(TAG, "Model loaded successfully:")
             inputInfo.forEach { (name, info) ->
-                Log.d(TAG, "  Input: $name, shape: ${info.info.shape.contentToString()}")
+                Log.d(TAG, "  Input: $name, type: ${info.info}")
             }
             outputInfo.forEach { (name, info) ->
-                Log.d(TAG, "  Output: $name, shape: ${info.info.shape.contentToString()}")
+                Log.d(TAG, "  Output: $name, type: ${info.info}")
             }
             
             isInitialized = true
@@ -262,9 +262,18 @@ class OnnxSuperResolution(
         // Convert bitmap to float array (NCHW format: [1, 3, H, W])
         val inputArray = bitmapToFloatArray(tile)
         
-        // Create ONNX tensor
+        // Create ONNX tensor - flatten the array for ONNX Runtime
         val inputShape = longArrayOf(1, 3, height.toLong(), width.toLong())
-        val inputTensor = OnnxTensor.createTensor(ortEnv, inputArray, inputShape)
+        val flatArray = FloatArray(1 * 3 * height * width)
+        var idx = 0
+        for (c in 0 until 3) {
+            for (h in 0 until height) {
+                for (w in 0 until width) {
+                    flatArray[idx++] = inputArray[0][c][h][w]
+                }
+            }
+        }
+        val inputTensor = OnnxTensor.createTensor(ortEnv, java.nio.FloatBuffer.wrap(flatArray), inputShape)
         
         // Run inference
         val inputs = mapOf(session.inputNames.first() to inputTensor)
