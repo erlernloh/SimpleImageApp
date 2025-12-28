@@ -78,11 +78,10 @@ object AvailableModels {
     )
     
     // ONNX models (Real-ESRGAN)
-    // TODO: Replace YOUR_USERNAME with your GitHub username after creating release
     val REAL_ESRGAN_X4_FP32 = ModelInfo(
         name = "Real-ESRGAN x4plus",
         fileName = "realesrgan_x4plus_fp32.onnx",
-        downloadUrl = "https://github.com/YOUR_USERNAME/SimpleImageApp/releases/download/v1.0.0/realesrgan_x4plus_fp32.onnx",
+        downloadUrl = "https://github.com/erlernloh/SimpleImageApp/releases/download/v1.0.0/realesrgan_x4plus_fp32.onnx",
         expectedSizeBytes = 2_000_000L, // ~2MB
         description = "Best quality 4x upscaling. Downloads ~2MB.",
         runtime = ModelRuntime.ONNX
@@ -91,7 +90,7 @@ object AvailableModels {
     val REAL_ESRGAN_X4_ANIME_FP32 = ModelInfo(
         name = "Real-ESRGAN x4plus Anime",
         fileName = "realesrgan_x4plus_anime_fp32.onnx",
-        downloadUrl = "https://github.com/YOUR_USERNAME/SimpleImageApp/releases/download/v1.0.0/realesrgan_x4plus_anime_fp32.onnx",
+        downloadUrl = "https://github.com/erlernloh/SimpleImageApp/releases/download/v1.0.0/realesrgan_x4plus_anime_fp32.onnx",
         expectedSizeBytes = 550_000L, // ~0.5MB
         description = "Sharper 4x upscaling for anime/illustrations. Downloads ~0.5MB.",
         runtime = ModelRuntime.ONNX
